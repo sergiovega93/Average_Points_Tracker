@@ -66,7 +66,15 @@ WRITE_XLSX_REPORT = os.getenv("WRITE_XLSX_REPORT", "false").lower() in (
 
 # --- Enricher ---
 ENRICHER_SHEET_NAME = os.getenv("ENRICHER_SHEET_NAME", "MA API ID").strip()
-ENRICHER_LOOKBACK_DAYS = int(os.getenv("ENRICHER_LOOKBACK_DAYS", "180"))
+# days: include rows with Creation Date >= now - N days (UTC).
+# since_last_run: use logs/last_enricher_run.iso (minus overlap); if missing, fall back to days.
+ENRICHER_LOOKBACK_MODE = os.getenv("ENRICHER_LOOKBACK_MODE", "days").strip().lower()
+ENRICHER_LOOKBACK_DAYS = int(os.getenv("ENRICHER_LOOKBACK_DAYS", "14"))
+ENRICHER_LOOKBACK_OVERLAP_HOURS = int(os.getenv("ENRICHER_LOOKBACK_OVERLAP_HOURS", "24"))
+_last_run_default = LOGS_DIR / "last_enricher_run.iso"
+ENRICHER_LAST_RUN_FILE = os.getenv(
+    "ENRICHER_LAST_RUN_FILE", str(_last_run_default)
+).strip()
 # Column title in Master Tracker that maps from MA placement_fee
 ORIGINATION_FEE_COLUMN = os.getenv(
     "ORIGINATION_FEE_COLUMN", "Origination Fee"

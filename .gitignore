@@ -7,6 +7,7 @@ __pycache__/
 logs/*.log
 logs/*.csv
 logs/*.txt
+logs/last_enricher_run.iso
 
 # Workbooks often contain sensitive data — keep locally / upload to PA via SFTP
 data/*.xlsx

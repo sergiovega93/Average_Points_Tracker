@@ -47,7 +47,44 @@ def get_table_dataframe(xlsx_path: str, table_name: str) -> pd.DataFrame:
         return pd.DataFrame()
     headers = [("" if h is None else str(h).strip()) for h in rows[0]]
     df = pd.DataFrame(rows[1:], columns=headers)
-    return df.dropna(how="all").reset_index(drop=True)
+    df = df.dropna(how="all").reset_index(drop=True)
+    # Normalize duplicate/odd header keys pandas may introduce
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def diagnose_patcher_fees(df: pd.DataFrame) -> None:
+    """Log rows where API Loan ID looks valid but Origination Fee is missing/zero (often stale formula cache)."""
+    if df.empty:
+        return
+    lid_col = config.PATCHER_COL_LOAN_ID
+    fee_col = config.PATCHER_COL_ORIG_FEE
+    if lid_col not in df.columns or fee_col not in df.columns:
+        print(
+            f"  [patcher] WARN: expected columns {lid_col!r} / {fee_col!r}; "
+            f"have: {list(df.columns)}"
+        )
+        return
+    bad = 0
+    samples = []
+    for _, row in df.iterrows():
+        lid = to_number(row.get(lid_col))
+        fee = to_number(row.get(fee_col))
+        if lid is None:
+            continue
+        if fee is None or fee <= 0:
+            bad += 1
+            if len(samples) < 5:
+                raw = row.get(fee_col)
+                samples.append((int(lid), raw, type(raw).__name__))
+    if bad:
+        print(
+            f"  [patcher] WARN: {bad} row(s) have {fee_col!r} missing/zero/non-numeric "
+            f"but {lid_col} set. Excel may need 'Recalculate workbook' then save "
+            f"(openpyxl reads cached formula results with data_only=True)."
+        )
+        for s in samples:
+            print(f"    sample loan_id={s[0]} raw_fee={s[1]!r} ({s[2]})")
 
 
 def to_number(x):
@@ -247,6 +284,7 @@ def run_patcher(*, dry_run: bool = False) -> list[dict]:
     Read patcher Excel, call MA API (or simulate if dry_run), write CSV to logs/.
     """
     df = get_table_dataframe(config.EXCEL_PATCHER_PATH, config.PATCHER_TABLE_NAME)
+    diagnose_patcher_fees(df)
     work = []
     for _, row in df.iterrows():
         loan_id = to_number(row.get(config.PATCHER_COL_LOAN_ID))

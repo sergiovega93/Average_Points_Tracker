@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -154,13 +155,67 @@ def _fee_is_missing_or_zero(val) -> bool:
         return True
 
 
+def _utc_now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_iso_utc_to_naive(s: str) -> datetime | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _enricher_cutoff_naive() -> datetime:
+    """
+    Rows with Creation Date >= cutoff (or Creation Date NaN) are enriched.
+    """
+    now_n = _utc_now_naive()
+    mode = (config.ENRICHER_LOOKBACK_MODE or "days").strip().lower()
+    if mode == "since_last_run":
+        p = Path(config.ENRICHER_LAST_RUN_FILE)
+        if p.is_file():
+            try:
+                last = _parse_iso_utc_to_naive(p.read_text(encoding="utf-8"))
+                if last is not None:
+                    overlap = timedelta(hours=config.ENRICHER_LOOKBACK_OVERLAP_HOURS)
+                    return last - overlap
+            except OSError:
+                pass
+        return now_n - timedelta(days=config.ENRICHER_LOOKBACK_DAYS)
+    return now_n - timedelta(days=config.ENRICHER_LOOKBACK_DAYS)
+
+
+def _write_last_enricher_run_marker() -> None:
+    p = Path(config.ENRICHER_LAST_RUN_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).isoformat()
+    p.write_text(stamp + "\n", encoding="utf-8")
+
+
 def run_enricher(*, dry_run: bool = False) -> dict:
     """
     Enrich Master Tracker from MA. Does not save workbook if dry_run.
     Returns a small summary dict (rows written, preserved fees count).
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(days=config.ENRICHER_LOOKBACK_DAYS)
-    print(f"  Cutoff (UTC): {cutoff.strftime('%Y-%m-%d %H:%M')} lookback_days={config.ENRICHER_LOOKBACK_DAYS}")
+    cutoff = _enricher_cutoff_naive()
+    mode = (config.ENRICHER_LOOKBACK_MODE or "days").strip().lower()
+    print(
+        f"  Enricher window: mode={mode!r} cutoff_utc_naive={cutoff:%Y-%m-%d %H:%M} "
+        f"lookback_days={config.ENRICHER_LOOKBACK_DAYS} "
+        f"overlap_h={config.ENRICHER_LOOKBACK_OVERLAP_HOURS}"
+    )
+    if mode == "since_last_run":
+        p = Path(config.ENRICHER_LAST_RUN_FILE)
+        print(f"  Last-run marker file: {p} (exists={p.is_file()})")
 
     df = pd.read_excel(
         config.EXCEL_TRACKER_PATH,
@@ -169,7 +224,7 @@ def run_enricher(*, dry_run: bool = False) -> dict:
     )
     if "Creation Date" in df.columns:
         df["Creation Date"] = pd.to_datetime(df["Creation Date"], errors="coerce")
-        mask = df["Creation Date"].isna() | (df["Creation Date"] >= cutoff.replace(tzinfo=None))
+        mask = df["Creation Date"].isna() | (df["Creation Date"] >= cutoff)
         loan_ids = df.loc[mask, config.API_LOAN_ID_COLUMN].dropna().astype(int)
     else:
         loan_ids = df[config.API_LOAN_ID_COLUMN].dropna().astype(int)
@@ -252,7 +307,13 @@ def run_enricher(*, dry_run: bool = False) -> dict:
     if dry_run:
         print(f"  [dry-run] would save workbook; preserved_fee_cells={preserved}")
         wb.close()
+        return summary
     else:
         wb.save(config.EXCEL_TRACKER_PATH)
-        print(f"  Workbook saved. origination_fee_preserved={preserved}")
+        _write_last_enricher_run_marker()
+        print(
+            f"  Workbook saved. origination_fee_preserved={preserved}; "
+            f"last-run marker updated."
+        )
+        wb.close()
     return summary
