@@ -174,19 +174,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.step in ("all", "placement", "enrich"):
         config.require_ma_credentials()
 
+    placement_results: list = []
+    enrich_summary: dict = {}
+
     if args.step in ("all", "placement"):
         log.info("STEP 1: Placement fee patcher")
         from steps.placement_patcher import run_patcher
 
-        results = run_patcher(dry_run=args.dry_run)
-        patched = sum(1 for r in results if r["action"] == "UPDATED")
-        skipped = sum(1 for r in results if r["action"] == "SKIPPED_ALREADY_SET")
-        errors = sum(1 for r in results if r["action"] == "ERROR")
-        old_core = sum(1 for r in results if r["action"] == "NOT_SUPPORTED_OLD_CORE")
-        dry_would = sum(1 for r in results if r["action"] in ("WOULD_PATCH", "WOULD_REVIEW"))
+        placement_results = run_patcher(dry_run=args.dry_run)
+        patched = sum(1 for r in placement_results if r["action"] == "UPDATED")
+        skipped = sum(1 for r in placement_results if r["action"] == "SKIPPED_ALREADY_SET")
+        errors = sum(1 for r in placement_results if r["action"] == "ERROR")
+        old_core = sum(1 for r in placement_results if r["action"] == "NOT_SUPPORTED_OLD_CORE")
+        dry_would = sum(
+            1
+            for r in placement_results
+            if r.get("action")
+            in ("DRY_RUN_WOULD_ATTEMPT_PATCH", "WOULD_PATCH", "WOULD_REVIEW")
+        )
         log.info(
-            "Step1 summary: n=%s patched=%s skipped=%s errors=%s old_core=%s dry_flags=%s",
-            len(results),
+            "Step1 summary: n=%s patched=%s skipped=%s errors=%s old_core=%s dry_would_attempt=%s",
+            len(placement_results),
             patched,
             skipped,
             errors,
@@ -198,15 +206,30 @@ def main(argv: list[str] | None = None) -> int:
         log.info("STEP 2: Points enricher")
         from steps.points_enricher import run_enricher
 
-        summary = run_enricher(dry_run=args.dry_run)
-        log.info("Step2 summary: %s", summary)
+        enrich_summary = run_enricher(dry_run=args.dry_run)
+        log.info("Step2 summary: %s", enrich_summary)
 
     if args.step in ("all", "backfill"):
-        log.info("STEP 3: Placement fee backfill (Excel -> Master)")
-        from steps.placement_fee_backfill import run_backfill
+        if args.dry_run and args.step == "all":
+            log.info(
+                "STEP 3: skipped separate disk backfill in full dry-run "
+                "(preview already written after step2 on in-memory merge)."
+            )
+        else:
+            log.info("STEP 3: Placement fee backfill (Excel -> Master)")
+            from steps.placement_fee_backfill import run_backfill
 
-        summary = run_backfill(dry_run=args.dry_run)
-        log.info("Step3 summary: %s", summary)
+            bf_summary = run_backfill(dry_run=args.dry_run)
+            log.info("Step3 summary: %s", bf_summary)
+
+    if args.dry_run and args.step == "all":
+        from steps.dry_run_report import dry_run_stamp, write_dry_run_aggregate_csv
+
+        agg_stamp = dry_run_stamp()
+        agg_path = write_dry_run_aggregate_csv(
+            agg_stamp, placement_results, enrich_summary
+        )
+        log.info("Dry-run aggregate CSV -> %s", agg_path)
 
     log.info("RUN COMPLETE")
     return 0

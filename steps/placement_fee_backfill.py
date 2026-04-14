@@ -41,6 +41,41 @@ def load_patcher_fees() -> dict[int, float]:
     return out
 
 
+def preview_backfill_on_worksheet(ws) -> list[dict]:
+    """
+    After enricher merged into ws in memory (dry-run), list rows that step-3 would fill
+    from the Placement Fee Patching workbook.
+    """
+    fees_by_loan = load_patcher_fees()
+    col_id = _find_header_column(ws, config.API_LOAN_ID_COLUMN)
+    col_fee = _find_header_column(ws, config.ORIGINATION_FEE_COLUMN)
+    if col_id is None or col_fee is None:
+        return []
+    out: list[dict] = []
+    for row_idx in range(2, ws.max_row + 1):
+        raw_id = ws.cell(row=row_idx, column=col_id).value
+        if raw_id is None or raw_id == "":
+            continue
+        try:
+            lid = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        current = ws.cell(row=row_idx, column=col_fee).value
+        if not _fee_is_missing_or_zero(current):
+            continue
+        desired = fees_by_loan.get(lid)
+        if desired is None:
+            continue
+        out.append(
+            {
+                "loan_id": lid,
+                "master_excel_row": row_idx,
+                "fee_would_set_from_patcher_excel": desired,
+            }
+        )
+    return out
+
+
 def run_backfill(*, dry_run: bool = False) -> dict:
     fees_by_loan = load_patcher_fees()
     wb = load_workbook(config.EXCEL_TRACKER_PATH)

@@ -276,7 +276,12 @@ def run_enricher(*, dry_run: bool = False) -> dict:
     col_start = static_cols + 1
     api_id_list = [cell.value for cell in ws["B"][1:]]
 
+    orig_off = ENRICHMENT_ORDER.index(config.ORIGINATION_FEE_COLUMN)
     preserved = 0
+    per_loan_rows: list[dict] = []
+    n_orig_ma = n_orig_pres = n_orig_empty = n_orig_api_err = 0
+    merge_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     for offset, col_name in enumerate(ENRICHMENT_ORDER):
         ws.cell(row=1, column=col_start + offset).value = col_name
 
@@ -291,6 +296,11 @@ def run_enricher(*, dry_run: bool = False) -> dict:
         if match.empty:
             continue
         d = match.iloc[0].to_dict()
+        fee_ma_raw = d.get(config.ORIGINATION_FEE_COLUMN)
+        existing_orig_cell = ws.cell(row=idx, column=col_start + orig_off).value
+        orig_source: str | None = None
+        api_err = d.get("Error")
+
         for offset, col_name in enumerate(ENRICHMENT_ORDER):
             val = d.get(col_name)
             if col_name == config.ORIGINATION_FEE_COLUMN:
@@ -299,15 +309,68 @@ def run_enricher(*, dry_run: bool = False) -> dict:
                     if not _fee_is_missing_or_zero(existing):
                         val = existing
                         preserved += 1
+                        orig_source = "preserved_master"
+                    else:
+                        orig_source = "empty_after_ma"
+                else:
+                    orig_source = "ma"
             ws.cell(row=idx, column=col_start + offset).value = (
                 "" if val in (None, {}, []) else val
             )
 
-    summary = {"rows_on_sheet": len(api_id_list), "origination_fee_preserved": preserved}
+        if api_err:
+            orig_source = orig_source or "api_row_error"
+        if not orig_source:
+            orig_source = "unknown"
+
+        if orig_source == "ma":
+            n_orig_ma += 1
+        elif orig_source == "preserved_master":
+            n_orig_pres += 1
+        elif orig_source == "empty_after_ma":
+            n_orig_empty += 1
+        elif orig_source == "api_row_error":
+            n_orig_api_err += 1
+
+        if dry_run:
+            per_loan_rows.append(
+                {
+                    "loan_id": lid,
+                    "origination_fee_from_ma_api": fee_ma_raw,
+                    "origination_fee_master_cell_before_merge": existing_orig_cell,
+                    "origination_fee_source_after_step2": orig_source,
+                    "api_row_error": api_err or "",
+                }
+            )
+
+    summary: dict = {
+        "rows_on_sheet": len(api_id_list),
+        "origination_fee_preserved": preserved,
+        "enrich_loan_count": int(len(loan_ids)),
+        "orig_from_ma": n_orig_ma,
+        "orig_preserved_master": n_orig_pres,
+        "orig_empty_after_ma": n_orig_empty,
+        "orig_api_row_error": n_orig_api_err,
+    }
+
     if dry_run:
-        print(f"  [dry-run] would save workbook; preserved_fee_cells={preserved}")
+        from .placement_fee_backfill import preview_backfill_on_worksheet
+
+        bf_prev = preview_backfill_on_worksheet(ws)
+        summary["backfill_preview_rows"] = bf_prev
+        if per_loan_rows:
+            p2 = config.LOGS_DIR / f"dryrun_step2_by_loan_{merge_stamp}.csv"
+            pd.DataFrame(per_loan_rows).to_csv(p2, index=False, encoding="utf-8-sig")
+            print(f"  [dry-run] per-loan enrich -> {p2}")
+        if bf_prev:
+            p3 = config.LOGS_DIR / f"dryrun_step3_backfill_preview_{merge_stamp}.csv"
+            pd.DataFrame(bf_prev).to_csv(p3, index=False, encoding="utf-8-sig")
+            print(f"  [dry-run] backfill preview (post-merge in memory) -> {p3}")
+        print(
+            f"  [dry-run] would save workbook; preserved_fee_cells={preserved}; "
+            f"step3 backfill rows that would get Excel fee: {len(bf_prev)}"
+        )
         wb.close()
-        return summary
     else:
         wb.save(config.EXCEL_TRACKER_PATH)
         _write_last_enricher_run_marker()

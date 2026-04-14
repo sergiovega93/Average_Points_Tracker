@@ -135,15 +135,26 @@ def loans_get(session: requests.Session, loan_id: int) -> dict:
         return {}
 
 
-def get_fee_and_title(session: requests.Session, loan_id: int):
+def get_fee_and_title(session: requests.Session, loan_id: int) -> tuple:
+    """
+    Returns (placement_fee, loan_title, error_message).
+    error_message is non-empty if loans/get did not return a usable result.
+    """
     js = loans_get(session, loan_id)
+    if not isinstance(js, dict) or not js.get("result"):
+        excerpt = ""
+        try:
+            excerpt = str(js)[:400]
+        except Exception:
+            pass
+        return None, None, excerpt or "loans/get returned no result (check MA_API_KEY / loan_id)"
     try:
         mort = js["result"]["mortgage"]
     except Exception:
         mort = {}
     fee = (mort.get("fees") or {}).get("placement_fee")
     loan_title = js.get("result", {}).get("loan_title")
-    return fee, loan_title
+    return fee, loan_title, ""
 
 
 def post_update(session: requests.Session, base_url: str, loan_id: int, fee: float) -> dict:
@@ -202,7 +213,20 @@ def patch_one(
     *,
     dry_run: bool,
 ) -> dict:
-    existing_before, loan_title = get_fee_and_title(session, loan_id)
+    existing_before, loan_title, get_err = get_fee_and_title(session, loan_id)
+    if get_err:
+        return {
+            "loan_id": loan_id,
+            "loan_title": loan_title,
+            "street": street,
+            "desired_fee": round(desired_fee, 2),
+            "existing_fee_before": None,
+            "existing_fee_after": None,
+            "action": "ERROR_LOANS_GET",
+            "status": None,
+            "endpoint": None,
+            "response_excerpt": get_err,
+        }
 
     if config.SKIP_IF_EXISTING_NONZERO and existing_before is not None and is_nonzero(
         existing_before
@@ -221,7 +245,8 @@ def patch_one(
         }
 
     if dry_run:
-        would = "WOULD_PATCH" if not is_nonzero(existing_before or 0) else "WOULD_REVIEW"
+        # GET-only: we know skip vs "would try PATCH"; UPDATED vs OLD_CORE needs POST.
+        action = "DRY_RUN_WOULD_ATTEMPT_PATCH"
         return {
             "loan_id": loan_id,
             "loan_title": loan_title,
@@ -229,16 +254,19 @@ def patch_one(
             "desired_fee": round(desired_fee, 2),
             "existing_fee_before": existing_before,
             "existing_fee_after": existing_before,
-            "action": would,
+            "action": action,
             "status": None,
             "endpoint": None,
-            "response_excerpt": "[dry-run] no loans/update sent",
+            "response_excerpt": (
+                "[dry-run] no loans/update; POST would be required to know "
+                "UPDATED vs NOT_SUPPORTED_OLD_CORE vs ERROR."
+            ),
         }
 
     res_v1 = post_update(session, config.MA_API_BASE_V1, loan_id, desired_fee)
     if not _is_old_core(res_v1):
         time.sleep(config.VERIFY_SETTLE_WAIT)
-        existing_after, _ = get_fee_and_title(session, loan_id)
+        existing_after, _, _ = get_fee_and_title(session, loan_id)
         ok = existing_after is not None and approx_equal(existing_after, desired_fee)
         return _build_result(
             loan_id,
@@ -253,7 +281,7 @@ def patch_one(
 
     res_v2 = post_update(session, config.MA_API_BASE_V2, loan_id, desired_fee)
     time.sleep(config.VERIFY_SETTLE_WAIT)
-    existing_after, _ = get_fee_and_title(session, loan_id)
+    existing_after, _, _ = get_fee_and_title(session, loan_id)
     if _is_old_core(res_v2):
         return _build_result(
             loan_id,
