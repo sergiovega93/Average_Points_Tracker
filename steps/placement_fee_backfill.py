@@ -76,7 +76,10 @@ def preview_backfill_on_worksheet(ws) -> list[dict]:
     return out
 
 
-def run_backfill(*, dry_run: bool = False) -> dict:
+def run_backfill(*, dry_run: bool = False, only_loan_ids: set[int] | None = None) -> dict:
+    """
+    If only_loan_ids is set, only rows whose API Loan ID is in that set may be updated.
+    """
     fees_by_loan = load_patcher_fees()
     wb = load_workbook(config.EXCEL_TRACKER_PATH)
     ws = wb[config.ENRICHER_SHEET_NAME]
@@ -107,6 +110,8 @@ def run_backfill(*, dry_run: bool = False) -> dict:
         try:
             lid = int(raw_id)
         except (TypeError, ValueError):
+            continue
+        if only_loan_ids is not None and lid not in only_loan_ids:
             continue
         current = ws.cell(row=row_idx, column=col_fee).value
         if not _fee_is_missing_or_zero(current):

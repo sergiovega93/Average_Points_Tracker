@@ -12,14 +12,17 @@ Automates Placement Fee patching against Mortgage Automator, enriches the Master
 
 ```
 loan-automator/
-  orchestrator.py          # entry point
+  orchestrator.py          # entry point (CLI + scheduled task)
+  flask_webhook.py         # register_routes(app) for PythonAnywhere / Zapier
+  loan_automator_queue.py  # SQLite queue + background worker thread
   config.py
   steps/
     placement_patcher.py
     points_enricher.py
     placement_fee_backfill.py
+    single_loan.py         # one loan_id pipeline (webhook / --loan-id)
   data/                    # place workbooks here (ignored by git)
-  logs/                    # run logs + CSV (ignored by git)
+  logs/                    # run logs + CSV + queue sqlite (ignored by git)
 ```
 
 ## Local setup
@@ -78,9 +81,42 @@ py -3 orchestrator.py --dry-run             # full pipeline, no writes to MA or 
 py -3 orchestrator.py --step placement      # single step
 py -3 orchestrator.py --step enrich
 py -3 orchestrator.py --step backfill     # no MA calls; only needs Excel paths
+py -3 orchestrator.py --loan-id 1202091  # single loan: patch + enrich row + backfill that id
+py -3 orchestrator.py --loan-id 1202091 --dry-run
 ```
 
 `--dry-run` still performs **GET** calls to MA where the step needs them, so credentials must be valid.
+
+### Zapier / Flask webhook (PythonAnywhere)
+
+1. Set **`LOAN_AUTOMATOR_WEBHOOK_SECRET`** in the same env your WSGI loads (e.g. `lmc.env`).
+2. Ensure **`sys.path`** includes the **absolute path** to this repo clone on PA.
+3. In `create_app()`, load the module the same way you do for PropStream (example):
+
+```python
+from pathlib import Path
+import importlib.util
+
+_base_dir = Path(__file__).resolve().parent.parent  # adjust if your layout differs
+_la = _base_dir / "loan-automator" / "flask_webhook.py"
+if _la.is_file():
+    spec = importlib.util.spec_from_file_location("loan_automator_flask", str(_la))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.register_routes(app, repo_root=str(_la.parent))
+```
+
+4. **Zapier POST** to `https://<your PA domain>/webhook/loan-automator` with JSON such as:
+
+```json
+{"loan_id": 1202091}
+```
+
+Optional: same JSON can include `"secret": "<same as LOAN_AUTOMATOR_WEBHOOK_SECRET>"` if you prefer not to use headers. Supported: **`X-Loan-Automator-Secret`**, **`X-Webhook-Secret`**, **`Authorization: Bearer …`**, or **`?token=…`**.
+
+5. The handler returns **202** with `job_id` and starts a **daemon thread** worker that processes the SQLite queue (**`QUEUE_DB_PATH`**, default under `logs/`). One worker per web process; on PythonAnywhere that is usually one process — jobs are still serialized in SQLite.
+
+Local testing without a secret: set **`LOAN_AUTOMATOR_WEBHOOK_ALLOW_INSECURE=1`** (never in production).
 
 ### Live pilot (writes MA + Master — use with care)
 

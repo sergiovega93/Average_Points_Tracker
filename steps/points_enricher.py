@@ -393,3 +393,116 @@ def run_enricher(
         )
         wb.close()
     return summary
+
+
+def _enrichment_col_start(ws) -> int:
+    header_row = [cell.value for cell in ws[1]]
+    static_cols = 3
+    while (
+        static_cols < len(header_row)
+        and header_row[static_cols]
+        and header_row[static_cols] not in ENRICHMENT_ORDER
+    ):
+        static_cols += 1
+    return static_cols + 1
+
+
+def _find_master_row_for_loan(ws, loan_id: int) -> int | None:
+    from .placement_fee_backfill import _find_header_column
+
+    col_id = _find_header_column(ws, config.API_LOAN_ID_COLUMN)
+    if col_id is None:
+        col_id = 2
+    for row_idx in range(2, ws.max_row + 1):
+        v = ws.cell(row=row_idx, column=col_id).value
+        try:
+            if int(v) == int(loan_id):
+                return row_idx
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def fetch_ma_enrichment_row(loan_id: int) -> dict:
+    """Single loans/get + same field mapping as batch enricher."""
+    session = requests.Session()
+    r = session.post(
+        "https://app.mortgageautomator.com/api/loans/get",
+        headers=_headers(),
+        json={"loan_id": int(loan_id)},
+        timeout=config.TIMEOUT_S,
+    )
+    data = r.json()
+    if not isinstance(data, dict) or not data.get("result"):
+        return {
+            config.API_LOAN_ID_COLUMN: int(loan_id),
+            "Error": "loans_get returned no result",
+        }
+    row: dict = {config.API_LOAN_ID_COLUMN: int(loan_id)}
+    for key, label in FIELD_MAP.items():
+        val = deep_get(data, key)
+        if "date" in key and isinstance(val, int):
+            val = datetime.fromtimestamp(val, tz=timezone.utc).strftime("%Y-%m-%d")
+        row[label] = "" if val in (None, {}, []) else val
+    row["Sales Rep"] = get_role_user(data, "Sales")
+    row["Office Rep"] = get_role_user(data, "Office Rep")
+    row.update(extract_status_dates(data))
+    time.sleep(config.SLEEP_BETWEEN_CALLS)
+    return row
+
+
+def merge_single_loan_into_master(
+    loan_id: int,
+    *,
+    dry_run: bool = False,
+    update_last_run_marker: bool = False,
+) -> dict:
+    """
+    Fetch MA for one loan and merge ENRICHMENT_ORDER into the matching Master row.
+    Does not touch other rows. By default does not update last_enricher_run.iso
+    (webhook / single-loan runs should not shrink since_last_run windows).
+    """
+    row = fetch_ma_enrichment_row(loan_id)
+    if row.get("Error"):
+        return {"error": row["Error"], "loan_id": loan_id}
+    wb = load_workbook(config.EXCEL_TRACKER_PATH)
+    ws = wb[config.ENRICHER_SHEET_NAME]
+    idx = _find_master_row_for_loan(ws, loan_id)
+    if idx is None:
+        wb.close()
+        return {"error": "master_row_not_found", "loan_id": loan_id}
+
+    col_start = _enrichment_col_start(ws)
+    orig_off = ENRICHMENT_ORDER.index(config.ORIGINATION_FEE_COLUMN)
+    d = row
+    preserved = 0
+
+    for offset, col_name in enumerate(ENRICHMENT_ORDER):
+        ws.cell(row=1, column=col_start + offset).value = col_name
+
+    for offset, col_name in enumerate(ENRICHMENT_ORDER):
+        val = d.get(col_name)
+        if col_name == config.ORIGINATION_FEE_COLUMN:
+            if _fee_is_missing_or_zero(val):
+                existing = ws.cell(row=idx, column=col_start + offset).value
+                if not _fee_is_missing_or_zero(existing):
+                    val = existing
+                    preserved += 1
+        ws.cell(row=idx, column=col_start + offset).value = (
+            "" if val in (None, {}, []) else val
+        )
+
+    summary = {
+        "loan_id": loan_id,
+        "master_row": idx,
+        "origination_fee_preserved": preserved,
+    }
+    if dry_run:
+        wb.close()
+        summary["dry_run"] = True
+    else:
+        wb.save(config.EXCEL_TRACKER_PATH)
+        if update_last_run_marker:
+            _write_last_enricher_run_marker()
+        wb.close()
+    return summary

@@ -172,6 +172,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="Override enricher window to last N calendar days (UTC), ignoring .env mode for this run.",
     )
+    parser.add_argument(
+        "--loan-id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="Run placement+enrich+backfill for a single API loan id (implies --step all).",
+    )
     args = parser.parse_args(argv)
 
     _ensure_utf8_stdio()
@@ -196,8 +203,24 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Use only one of --placement-last-n or --placement-first-n")
         return 2
 
+    if args.loan_id is not None:
+        if args.placement_last_n is not None or args.placement_first_n is not None:
+            log.error("Do not combine --loan-id with --placement-last-n / --placement-first-n")
+            return 2
+        if args.step != "all":
+            log.error("--loan-id only supports --step all (default)")
+            return 2
+
     if args.step in ("all", "placement", "enrich"):
         config.require_ma_credentials()
+
+    if args.loan_id is not None:
+        from steps.single_loan import run_pipeline_for_loan_id
+
+        out = run_pipeline_for_loan_id(args.loan_id, dry_run=args.dry_run)
+        log.info("Single-loan pipeline result: %s", out)
+        log.info("RUN COMPLETE")
+        return 0
 
     placement_results: list = []
     enrich_summary: dict = {}

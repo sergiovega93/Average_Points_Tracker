@@ -9,6 +9,7 @@ logs/*.csv
 logs/*.txt
 logs/last_enricher_run.iso
 logs/dryrun_*.csv
+logs/*.sqlite
 
 # Workbooks often contain sensitive data — keep locally / upload to PA via SFTP
 data/*.xlsx

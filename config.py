@@ -81,6 +81,13 @@ ORIGINATION_FEE_COLUMN = os.getenv(
 ).strip()
 API_LOAN_ID_COLUMN = os.getenv("API_LOAN_ID_COLUMN", "API Loan ID").strip()
 
+# --- Webhook / job queue (optional; used by webhook_flask.py on PythonAnywhere) ---
+LOAN_AUTOMATOR_WEBHOOK_SECRET = os.getenv("LOAN_AUTOMATOR_WEBHOOK_SECRET", "").strip()
+QUEUE_DB_PATH = os.getenv(
+    "QUEUE_DB_PATH",
+    str(LOGS_DIR / "loan_automator_queue.sqlite"),
+).strip()
+
 
 def require_ma_credentials() -> None:
     if not MA_LENDER_ID or not MA_API_KEY:
