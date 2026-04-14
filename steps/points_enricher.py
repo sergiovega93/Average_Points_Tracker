@@ -174,11 +174,14 @@ def _parse_iso_utc_to_naive(s: str) -> datetime | None:
     return dt
 
 
-def _enricher_cutoff_naive() -> datetime:
+def _enricher_cutoff_naive(*, lookback_days_override: int | None = None) -> datetime:
     """
     Rows with Creation Date >= cutoff (or Creation Date NaN) are enriched.
+    If lookback_days_override is set, use plain (now - N days) UTC for this run only.
     """
     now_n = _utc_now_naive()
+    if lookback_days_override is not None:
+        return now_n - timedelta(days=max(1, int(lookback_days_override)))
     mode = (config.ENRICHER_LOOKBACK_MODE or "days").strip().lower()
     if mode == "since_last_run":
         p = Path(config.ENRICHER_LAST_RUN_FILE)
@@ -201,19 +204,29 @@ def _write_last_enricher_run_marker() -> None:
     p.write_text(stamp + "\n", encoding="utf-8")
 
 
-def run_enricher(*, dry_run: bool = False) -> dict:
+def run_enricher(
+    *,
+    dry_run: bool = False,
+    lookback_days_override: int | None = None,
+) -> dict:
     """
     Enrich Master Tracker from MA. Does not save workbook if dry_run.
     Returns a small summary dict (rows written, preserved fees count).
     """
-    cutoff = _enricher_cutoff_naive()
+    cutoff = _enricher_cutoff_naive(lookback_days_override=lookback_days_override)
     mode = (config.ENRICHER_LOOKBACK_MODE or "days").strip().lower()
-    print(
-        f"  Enricher window: mode={mode!r} cutoff_utc_naive={cutoff:%Y-%m-%d %H:%M} "
-        f"lookback_days={config.ENRICHER_LOOKBACK_DAYS} "
-        f"overlap_h={config.ENRICHER_LOOKBACK_OVERLAP_HOURS}"
-    )
-    if mode == "since_last_run":
+    if lookback_days_override is not None:
+        print(
+            f"  Enricher window: **override** lookback_days={lookback_days_override} only "
+            f"(cutoff_utc_naive={cutoff:%Y-%m-%d %H:%M})"
+        )
+    else:
+        print(
+            f"  Enricher window: mode={mode!r} cutoff_utc_naive={cutoff:%Y-%m-%d %H:%M} "
+            f"lookback_days={config.ENRICHER_LOOKBACK_DAYS} "
+            f"overlap_h={config.ENRICHER_LOOKBACK_OVERLAP_HOURS}"
+        )
+    if lookback_days_override is None and mode == "since_last_run":
         p = Path(config.ENRICHER_LAST_RUN_FILE)
         print(f"  Last-run marker file: {p} (exists={p.is_file()})")
 

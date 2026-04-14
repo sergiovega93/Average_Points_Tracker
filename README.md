@@ -82,6 +82,21 @@ py -3 orchestrator.py --step backfill     # no MA calls; only needs Excel paths
 
 `--dry-run` still performs **GET** calls to MA where the step needs them, so credentials must be valid.
 
+### Live pilot (writes MA + Master — use with care)
+
+Process only the **last 5** loans from the Placement table and enrich Master rows from roughly the **last 2 days** (UTC):
+
+```powershell
+cd C:\Users\serch\loan-automator
+py -3 orchestrator.py --placement-last-n 5 --enrich-lookback-days 2
+```
+
+Omit both flags to run the **full** worklist and the enricher window from `.env`. For a dry-run with the same scope:
+
+```powershell
+py -3 orchestrator.py --dry-run --placement-last-n 5 --enrich-lookback-days 2
+```
+
 ## PythonAnywhere
 
 - Clone the repo, `pip install --user -r requirements.txt`.

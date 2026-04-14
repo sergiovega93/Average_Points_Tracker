@@ -307,10 +307,20 @@ def patch_one(
     )
 
 
-def run_patcher(*, dry_run: bool = False) -> list[dict]:
+def run_patcher(
+    *,
+    dry_run: bool = False,
+    placement_first_n: int | None = None,
+    placement_last_n: int | None = None,
+) -> list[dict]:
     """
     Read patcher Excel, call MA API (or simulate if dry_run), write CSV to logs/.
+    placement_first_n / placement_last_n: optional slice of the worklist (after filtering
+    invalid rows), in table iteration order — use for pilot runs.
     """
+    if placement_first_n is not None and placement_last_n is not None:
+        raise ValueError("Use only one of placement_first_n or placement_last_n")
+
     df = get_table_dataframe(config.EXCEL_PATCHER_PATH, config.PATCHER_TABLE_NAME)
     diagnose_patcher_fees(df)
     work = []
@@ -324,6 +334,16 @@ def run_patcher(*, dry_run: bool = False) -> list[dict]:
 
     if not work:
         return []
+
+    total_before_slice = len(work)
+    if placement_last_n is not None:
+        n = max(1, int(placement_last_n))
+        work = work[-n:]
+        print(f"  [scope] using last {len(work)} of {total_before_slice} patcher row(s)")
+    elif placement_first_n is not None:
+        n = max(1, int(placement_first_n))
+        work = work[:n]
+        print(f"  [scope] using first {len(work)} of {total_before_slice} patcher row(s)")
 
     session = requests.Session()
     results = []

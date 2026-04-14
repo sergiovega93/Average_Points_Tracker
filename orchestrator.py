@@ -151,6 +151,27 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
         help="Run a single step (default: all).",
     )
+    parser.add_argument(
+        "--placement-last-n",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Pilot: only the last N rows of the patcher worklist (table order).",
+    )
+    parser.add_argument(
+        "--placement-first-n",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Pilot: only the first N rows of the patcher worklist (table order).",
+    )
+    parser.add_argument(
+        "--enrich-lookback-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override enricher window to last N calendar days (UTC), ignoring .env mode for this run.",
+    )
     args = parser.parse_args(argv)
 
     _ensure_utf8_stdio()
@@ -171,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.verify:
         return verify_environment(ping_api=args.verify_api)
 
+    if args.placement_last_n is not None and args.placement_first_n is not None:
+        log.error("Use only one of --placement-last-n or --placement-first-n")
+        return 2
+
     if args.step in ("all", "placement", "enrich"):
         config.require_ma_credentials()
 
@@ -181,10 +206,15 @@ def main(argv: list[str] | None = None) -> int:
         log.info("STEP 1: Placement fee patcher")
         from steps.placement_patcher import run_patcher
 
-        placement_results = run_patcher(dry_run=args.dry_run)
+        placement_results = run_patcher(
+            dry_run=args.dry_run,
+            placement_first_n=args.placement_first_n,
+            placement_last_n=args.placement_last_n,
+        )
         patched = sum(1 for r in placement_results if r["action"] == "UPDATED")
         skipped = sum(1 for r in placement_results if r["action"] == "SKIPPED_ALREADY_SET")
         errors = sum(1 for r in placement_results if r["action"] == "ERROR")
+        get_errs = sum(1 for r in placement_results if r.get("action") == "ERROR_LOANS_GET")
         old_core = sum(1 for r in placement_results if r["action"] == "NOT_SUPPORTED_OLD_CORE")
         dry_would = sum(
             1
@@ -193,11 +223,13 @@ def main(argv: list[str] | None = None) -> int:
             in ("DRY_RUN_WOULD_ATTEMPT_PATCH", "WOULD_PATCH", "WOULD_REVIEW")
         )
         log.info(
-            "Step1 summary: n=%s patched=%s skipped=%s errors=%s old_core=%s dry_would_attempt=%s",
+            "Step1 summary: n=%s patched=%s skipped=%s errors=%s loans_get_errors=%s "
+            "old_core=%s dry_would_attempt=%s",
             len(placement_results),
             patched,
             skipped,
             errors,
+            get_errs,
             old_core,
             dry_would,
         )
@@ -206,7 +238,10 @@ def main(argv: list[str] | None = None) -> int:
         log.info("STEP 2: Points enricher")
         from steps.points_enricher import run_enricher
 
-        enrich_summary = run_enricher(dry_run=args.dry_run)
+        enrich_summary = run_enricher(
+            dry_run=args.dry_run,
+            lookback_days_override=args.enrich_lookback_days,
+        )
         log.info("Step2 summary: %s", enrich_summary)
 
     if args.step in ("all", "backfill"):
