@@ -20,14 +20,17 @@ else:
 LOGS_DIR = BASE_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-EXCEL_PATCHER_PATH = os.getenv(
-    "EXCEL_PATCHER_PATH",
-    str(BASE_DIR / "data" / "Placement_Fee_Patching.xlsx"),
-).strip()
-EXCEL_TRACKER_PATH = os.getenv(
-    "EXCEL_TRACKER_PATH",
-    str(BASE_DIR / "data" / "Master_Tracker_Points_Average.xlsx"),
-).strip()
+def _env_path(name: str, default: Path) -> str:
+    raw = os.getenv(name, "").strip()
+    return str(default) if not raw else raw
+
+
+EXCEL_PATCHER_PATH = _env_path(
+    "EXCEL_PATCHER_PATH", BASE_DIR / "data" / "Placement_Fee_Patching.xlsx"
+)
+EXCEL_TRACKER_PATH = _env_path(
+    "EXCEL_TRACKER_PATH", BASE_DIR / "data" / "Master_Tracker_Points_Average.xlsx"
+)
 
 MA_LENDER_ID = os.getenv("MA_LENDER_ID", "").strip()
 MA_API_KEY = os.getenv("MA_API_KEY", "").strip()
