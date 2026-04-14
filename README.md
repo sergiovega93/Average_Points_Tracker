@@ -89,16 +89,17 @@ py -3 orchestrator.py --loan-id 1202091 --dry-run
 
 ### Zapier / Flask webhook (PythonAnywhere)
 
-1. Set **`LOAN_AUTOMATOR_WEBHOOK_SECRET`** in the same env your WSGI loads (e.g. `lmc.env`).
-2. Ensure **`sys.path`** includes the **absolute path** to this repo clone on PA.
-3. In `create_app()`, load the module the same way you do for PropStream (example):
+On PA this project may live under **`/home/sergiovegadev93/mysite/average_points`** (folder name is fine; GitHub repo can still be `Average_Points_Tracker` or similar).
+
+1. Set **`LOAN_AUTOMATOR_WEBHOOK_SECRET`** in `~/.secrets/lmc.env` (or wherever WSGI loads), e.g. `export LOAN_AUTOMATOR_WEBHOOK_SECRET='...'` — use the **same** value in Zapier (e.g. header **`X-Webhook-Secret`**, same pattern as `closing_docs`).
+2. Ensure **`sys.path`** includes the **absolute path** to the clone (`.../mysite/average_points`) before `exec_module`, or pass **`repo_root`** below.
+3. In `create_app()`, load the module the same way you do for PropStream / `closing_docs` (example):
 
 ```python
 from pathlib import Path
 import importlib.util
 
-_base_dir = Path(__file__).resolve().parent.parent  # adjust if your layout differs
-_la = _base_dir / "loan-automator" / "flask_webhook.py"
+_la = Path("/home/sergiovegadev93/mysite/average_points/flask_webhook.py")
 if _la.is_file():
     spec = importlib.util.spec_from_file_location("loan_automator_flask", str(_la))
     mod = importlib.util.module_from_spec(spec)
@@ -106,13 +107,11 @@ if _la.is_file():
     mod.register_routes(app, repo_root=str(_la.parent))
 ```
 
-4. **Zapier POST** to `https://<your PA domain>/webhook/loan-automator` with JSON such as:
+4. **Zapier Custom Request (POST)** to `https://sergiovegadev93.pythonanywhere.com/webhook/loan-automator` with:
+   - **Headers:** `Content-Type: application/json`, **`X-Webhook-Secret`**: same as `LOAN_AUTOMATOR_WEBHOOK_SECRET`
+   - **Body (JSON):** `{"loan_id": 1202091}` or **`{"api_loan_id": 1202091}`** (both supported, aligned with other zaps)
 
-```json
-{"loan_id": 1202091}
-```
-
-Optional: same JSON can include `"secret": "<same as LOAN_AUTOMATOR_WEBHOOK_SECRET>"` if you prefer not to use headers. Supported: **`X-Loan-Automator-Secret`**, **`X-Webhook-Secret`**, **`Authorization: Bearer …`**, or **`?token=…`**.
+Optional: JSON field `"secret"` instead of header. Also supported: **`X-Loan-Automator-Secret`**, **`Authorization: Bearer …`**, **`?token=…`**.
 
 5. The handler returns **202** with `job_id` and starts a **daemon thread** worker that processes the SQLite queue (**`QUEUE_DB_PATH`**, default under `logs/`). One worker per web process; on PythonAnywhere that is usually one process — jobs are still serialized in SQLite.
 
