@@ -31,7 +31,7 @@ copy .env.example .env
 # Edit .env: MA_LENDER_ID, MA_API_KEY, EXCEL_* paths
 ```
 
-Copy your workbooks into `data/` or point `EXCEL_PATCHER_PATH` / `EXCEL_TRACKER_PATH` to absolute paths.
+Copy your workbooks into `data/` or point `EXCEL_PATCHER_PATH` / `EXCEL_TRACKER_PATH` to absolute paths in `.env`. Leaving those two lines empty in `.env` now falls back to the default files under `data/` (empty string used to mean “ignore default”; that is fixed in `config.py`).
 
 ### Smoke test (synthetic workbooks)
 
