@@ -24,15 +24,19 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --- Mortgage Automator ---
-MA_LENDER_ID = os.getenv("MA_LENDER_ID", "").strip()
+# Accept the names this repo defined originally, AND the names the rest of mysite
+# already uses (MA_ACCOUNT_ID / MA_BASE_URL) so we share one ~/.secrets/lmc.env.
+MA_LENDER_ID = (
+    os.getenv("MA_LENDER_ID") or os.getenv("MA_ACCOUNT_ID") or ""
+).strip()
 MA_API_KEY = os.getenv("MA_API_KEY", "").strip()
 
-MA_API_BASE_V1 = os.getenv(
-    "MA_API_BASE_V1", "https://app.mortgageautomator.com/api"
+_ma_base_default = "https://app.mortgageautomator.com/api"
+_ma_base_env = (
+    os.getenv("MA_API_BASE_V1") or os.getenv("MA_BASE_URL") or _ma_base_default
 ).rstrip("/")
-MA_API_BASE_V2 = os.getenv(
-    "MA_API_BASE_V2", "https://app.mortgageautomator.com/api/v2"
-).rstrip("/")
+MA_API_BASE_V1 = _ma_base_env
+MA_API_BASE_V2 = os.getenv("MA_API_BASE_V2", f"{_ma_base_env}/v2").rstrip("/")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
