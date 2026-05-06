@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 import config
 from services.graph_excel import (
+    GraphExcelError,
     add_table_columns_if_missing,
     get_table_columns,
     jsonify_value,
@@ -345,6 +346,56 @@ def _merge_enriched_into_df(
     return df, {"summary": summary, "audit_rows": audit_rows}
 
 
+def _realign_to_current_table(wb, df_merged: pd.DataFrame) -> pd.DataFrame:
+    """
+    Re-read tbl_avgpoints fresh from Graph and project df_merged's enrichment
+    values onto whatever rows currently exist in SharePoint, matched by
+    API Loan ID. Any rows present in the live table but not in df_merged
+    (e.g. added by a teammate during processing) keep their current SharePoint
+    values for the enricher-managed columns. Returns a DataFrame whose row
+    count exactly matches the current table size (so update_table_column
+    PATCHes will not error on dimension mismatch).
+    """
+    df_now = read_table(wb, config.ENRICHER_TABLE_NAME)
+    api_col = config.API_LOAN_ID_COLUMN
+    if df_now.empty or api_col not in df_now.columns:
+        return df_now
+
+    lookup: dict[int, pd.Series] = {}
+    if api_col in df_merged.columns:
+        for _, r in df_merged.iterrows():
+            lid_raw = r.get(api_col)
+            if pd.isna(lid_raw):
+                continue
+            try:
+                lookup[int(lid_raw)] = r
+            except (TypeError, ValueError):
+                continue
+
+    enrich_cols = [
+        c for c in ENRICHMENT_ORDER
+        if c in df_merged.columns and c in df_now.columns
+    ]
+    if not enrich_cols or not lookup:
+        return df_now
+
+    aligned = df_now.copy()
+    for idx, fresh_row in df_now.iterrows():
+        lid_raw = fresh_row.get(api_col)
+        if pd.isna(lid_raw):
+            continue
+        try:
+            lid = int(lid_raw)
+        except (TypeError, ValueError):
+            continue
+        merged_row = lookup.get(lid)
+        if merged_row is None:
+            continue
+        for c in enrich_cols:
+            aligned.at[idx, c] = merged_row.get(c)
+    return aligned
+
+
 def run_enricher(
     *,
     dry_run: bool = False,
@@ -445,16 +496,48 @@ def run_enricher(
                 f"Excel fee: {len(bf_prev)}"
             )
         else:
-            touched_cols = [c for c in ENRICHMENT_ORDER if c in df_merged.columns]
+            print("  Re-reading table to detect concurrent edits before writing...")
+            df_aligned = _realign_to_current_table(wb, df_merged)
+            size_diff = len(df_aligned) - len(df_merged)
+            if size_diff != 0:
+                kind = "added" if size_diff > 0 else "removed"
+                print(
+                    f"  [enrich] table size changed during processing: "
+                    f"{len(df_merged)} -> {len(df_aligned)} rows "
+                    f"({abs(size_diff)} {kind} by other editors; "
+                    f"new rows kept as-is, will be enriched on next run)."
+                )
+
+            touched_cols = [c for c in ENRICHMENT_ORDER if c in df_aligned.columns]
             print(
                 f"  Pushing {len(touched_cols)} column(s) to Graph "
                 f"(leaves user-managed columns + formulas untouched)..."
             )
             for col_name in touched_cols:
-                values = df_merged[col_name].tolist()
-                update_table_column(
-                    wb, config.ENRICHER_TABLE_NAME, col_name, values
-                )
+                for attempt in range(3):
+                    try:
+                        update_table_column(
+                            wb,
+                            config.ENRICHER_TABLE_NAME,
+                            col_name,
+                            df_aligned[col_name].tolist(),
+                        )
+                        break
+                    except GraphExcelError as exc:
+                        msg = str(exc)
+                        is_size_error = (
+                            "doesn't match the size" in msg
+                            or "doesn't match the dimensions" in msg
+                            or "InvalidArgument" in msg
+                            and "rows or columns" in msg
+                        )
+                        if not is_size_error or attempt == 2:
+                            raise
+                        print(
+                            f"  [enrich] {col_name}: size mismatch on attempt "
+                            f"{attempt + 1}/3; re-reading table & realigning..."
+                        )
+                        df_aligned = _realign_to_current_table(wb, df_merged)
             _write_last_enricher_run_marker()
             print(
                 f"  Workbook saved (column-by-column Graph PATCH). "
