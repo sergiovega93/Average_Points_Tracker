@@ -27,7 +27,7 @@ loan-automator/
     single_loan.py             # one loan_id pipeline (webhook / --loan-id)
     dry_run_report.py
   dev/
-    verify_graph_excel.py      # smoke test for Graph + SharePoint paths
+    verify_graph_excel.py      # smoke test for Graph + SharePoint paths (small push)
   logs/                        # run logs + CSV + queue sqlite (ignored by git)
 ```
 
