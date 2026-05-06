@@ -2,27 +2,33 @@
 
 Automates Placement Fee patching against Mortgage Automator, enriches the Master Tracker from the MA API, then backfills **Origination Fee** from the patcher workbook when MA still has no fee (for example old-core loans).
 
+All workbook reads/writes go through **Microsoft Graph (SharePoint Excel API)**: the patcher and tracker live in SharePoint and are edited in place via Graph workbook sessions. There is no local-file fallback.
+
 ## Flow
 
-1. **Placement patcher** — reads the patcher Excel table, `POST loans/update` when the fee in MA is missing/zero (unless skipped by policy).
-2. **Points enricher** — refreshes MA-driven columns on the `MA API ID` sheet. If MA returns an empty/zero **Origination Fee**, the cell is **not overwritten** when the workbook already has a non-zero value.
-3. **Backfill** — for rows where **Origination Fee** is still empty/zero, writes the amount from the patcher table (same `API Loan ID`).
+1. **Placement patcher** — reads the patcher SharePoint table (`tbl_of`), `POST loans/update` when the fee in MA is missing/zero (unless skipped by policy).
+2. **Points enricher** — refreshes MA-driven columns on the tracker table (`tbl_avgpoints`, sheet `MA API ID`). If MA returns an empty/zero **Origination Fee**, the cell is **not overwritten** when the workbook already has a non-zero value.
+3. **Backfill** — for rows where **Origination Fee** is still empty/zero, writes the amount from the patcher table (matched by `API Loan ID`).
 
 ## Layout
 
 ```
 loan-automator/
-  orchestrator.py          # entry point (CLI + scheduled task)
-  flask_webhook.py         # register_routes(app) for PythonAnywhere / Zapier
-  loan_automator_queue.py  # SQLite queue + background worker thread
+  orchestrator.py              # entry point (CLI + scheduled task)
+  flask_webhook.py             # register_routes(app) for PythonAnywhere / Zapier
+  loan_automator_queue.py      # SQLite queue + background worker thread
   config.py
+  services/
+    graph_excel.py             # Microsoft Graph Excel helper (token, sessions, table I/O)
   steps/
     placement_patcher.py
     points_enricher.py
     placement_fee_backfill.py
-    single_loan.py         # one loan_id pipeline (webhook / --loan-id)
-  data/                    # place workbooks here (ignored by git)
-  logs/                    # run logs + CSV + queue sqlite (ignored by git)
+    single_loan.py             # one loan_id pipeline (webhook / --loan-id)
+    dry_run_report.py
+  dev/
+    verify_graph_excel.py      # smoke test for Graph + SharePoint paths
+  logs/                        # run logs + CSV + queue sqlite (ignored by git)
 ```
 
 ## Local setup
@@ -31,21 +37,23 @@ loan-automator/
 cd loan-automator
 py -3 -m pip install -r requirements.txt
 copy .env.example .env
-# Edit .env: MA_LENDER_ID, MA_API_KEY, EXCEL_* paths
+# Edit .env: MA_LENDER_ID, MA_API_KEY, MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET
 ```
 
-Copy your workbooks into `data/` or point `EXCEL_PATCHER_PATH` / `EXCEL_TRACKER_PATH` to absolute paths in `.env`. Leaving those two lines empty in `.env` now falls back to the default files under `data/` (empty string used to mean “ignore default”; that is fixed in `config.py`).
+The default SharePoint paths in `config.py` already point to:
 
-### Smoke test (synthetic workbooks)
+- Patcher: `General/Project Raptor 3/Underwritting/Placement Fee Patching.xlsx` (table `tbl_of`)
+- Tracker: `General/Project Raptor 3/Sales/Master Tracker Points Average.xlsx` (table `tbl_avgpoints`, sheet `MA API ID`)
+
+Override `EXCEL_PATCHER_SP_PATH` / `EXCEL_TRACKER_SP_PATH` in `.env` if those files move.
+
+### Smoke test
 
 ```powershell
-py -3 dev\create_sample_workbooks.py
-$env:MA_LENDER_ID="10134"; $env:MA_API_KEY="your_key"
-py -3 orchestrator.py --verify
-py -3 orchestrator.py --step backfill --dry-run
+py -3 dev\verify_graph_excel.py
 ```
 
-Replace sample files with real workbooks before using MA steps.
+Validates Graph credentials, resolves site + drive, opens both workbooks, lists table columns, prints the first 3 rows. Set `CONFIRM_WRITE=1` to also try a no-op cell PATCH (writes the cell's current value back).
 
 ### Enricher window (avoid re-fetching 180 days every run)
 
@@ -58,12 +66,8 @@ Writes under `logs/`:
 
 - `placement_patch_*_dryrun.csv` — per loan from the patcher workbook (`DRY_RUN_WOULD_ATTEMPT_PATCH` vs `SKIPPED_ALREADY_SET` vs `ERROR_LOANS_GET`).
 - `dryrun_step2_by_loan_*.csv` — each merged Master row: origination fee from MA, existing cell, and source after virtual step 2 (`ma` / `preserved_master` / `empty_after_ma`).
-- `dryrun_step3_backfill_preview_*.csv` — loans that would receive Origination Fee from the Placement Fee Patching Excel after step 2 (computed on the **in-memory** merged sheet; step 3 on disk is skipped in full dry-run so this stays consistent).
+- `dryrun_step3_backfill_preview_*.csv` — loans that would receive Origination Fee from the patcher table after step 2 (computed on the **in-memory** merged table; step 3 disk PATCH is skipped in full dry-run so this stays consistent).
 - `dryrun_aggregate_*.csv` — rolled-up counts + notes (including that **UPDATED vs OLD_CORE** only appear after a real `loans/update`).
-
-### Placement patcher: “Origination Fee” reads as 0 / empty
-
-The patcher reads the Excel table with **cached formula values** (`data_only=True`). If Excel never saved recalculated values, fees can appear empty/zero in Python even when the UI shows numbers. Fix: open the workbook in Excel, **Recalculate** (Ctrl+Alt+F9 / “Calculate Now”), **Save**, then rerun. The patcher also prints a **WARN** with sample rows when it detects loan IDs with missing/non-positive fees.
 
 ### Optional: shared secrets file (same idea as WSGI on PythonAnywhere)
 
@@ -75,13 +79,13 @@ py -3 orchestrator.py --verify
 ## CLI
 
 ```text
-py -3 orchestrator.py --verify              # paths, tables, credentials
+py -3 orchestrator.py --verify              # MA creds, Graph creds, SharePoint reachability, tables exist
 py -3 orchestrator.py --verify --verify-api # also POST loans/get for VERIFY_LOAN_ID
-py -3 orchestrator.py --dry-run             # full pipeline, no writes to MA or workbooks
+py -3 orchestrator.py --dry-run             # full pipeline, no writes to MA or workbooks (Graph PATCH is skipped)
 py -3 orchestrator.py --step placement      # single step
 py -3 orchestrator.py --step enrich
-py -3 orchestrator.py --step backfill     # no MA calls; only needs Excel paths
-py -3 orchestrator.py --loan-id 1202091  # single loan: patch + enrich row + backfill that id
+py -3 orchestrator.py --step backfill       # no MA calls; only needs Graph
+py -3 orchestrator.py --loan-id 1202091     # single loan: patch + enrich row + backfill that id
 py -3 orchestrator.py --loan-id 1202091 --dry-run
 ```
 
@@ -89,31 +93,19 @@ py -3 orchestrator.py --loan-id 1202091 --dry-run
 
 ### Zapier / Flask webhook (PythonAnywhere)
 
-On PA this project may live under **`/home/sergiovegadev93/mysite/average_points`** (folder name is fine; GitHub repo can still be `Average_Points_Tracker` or similar).
+On PA this repo is cloned at **`/home/sergiovegadev93/loan-automator`** (sibling of `mysite`). The Flask app `mysite` registers the route via a shim in `mysite/app/blueprints/loan_automator.py` that loads `flask_webhook.py` from the sibling repo with `importlib`.
 
-1. Set **`LOAN_AUTOMATOR_WEBHOOK_SECRET`** in `~/.secrets/lmc.env` (or wherever WSGI loads), e.g. `export LOAN_AUTOMATOR_WEBHOOK_SECRET='...'` — use the **same** value in Zapier (e.g. header **`X-Webhook-Secret`**, same pattern as `closing_docs`).
-2. Ensure **`sys.path`** includes the **absolute path** to the clone (`.../mysite/average_points`) before `exec_module`, or pass **`repo_root`** below.
-3. In `create_app()`, load the module the same way you do for PropStream / `closing_docs` (example):
-
-```python
-from pathlib import Path
-import importlib.util
-
-_la = Path("/home/sergiovegadev93/mysite/average_points/flask_webhook.py")
-if _la.is_file():
-    spec = importlib.util.spec_from_file_location("loan_automator_flask", str(_la))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    mod.register_routes(app, repo_root=str(_la.parent))
-```
-
-4. **Zapier Custom Request (POST)** to `https://sergiovegadev93.pythonanywhere.com/webhook/loan-automator` with:
-   - **Headers:** `Content-Type: application/json`, **`X-Webhook-Secret`**: same as `LOAN_AUTOMATOR_WEBHOOK_SECRET`
-   - **Body (JSON):** `{"loan_id": 1202091}` or **`{"api_loan_id": 1202091}`** (both supported, aligned with other zaps)
+1. Set the secrets in **`/home/sergiovegadev93/.secrets/lmc.env`** (loaded by WSGI):
+   - `MA_LENDER_ID`, `MA_API_KEY`
+   - `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`
+   - `LOAN_AUTOMATOR_WEBHOOK_SECRET` (also set the same value in Zapier).
+2. **Zapier Custom Request (POST)** to `https://sergiovegadev93.pythonanywhere.com/webhook/loan-automator` with:
+   - **Headers:** `Content-Type: application/json`, **`X-Webhook-Secret`**: same as `LOAN_AUTOMATOR_WEBHOOK_SECRET`.
+   - **Body (JSON):** `{"loan_id": 1202091}` or **`{"api_loan_id": 1202091}`** (both supported, aligned with other zaps).
 
 Optional: JSON field `"secret"` instead of header. Also supported: **`X-Loan-Automator-Secret`**, **`Authorization: Bearer …`**, **`?token=…`**.
 
-5. The handler returns **202** with `job_id` and starts a **daemon thread** worker that processes the SQLite queue (**`QUEUE_DB_PATH`**, default under `logs/`). One worker per web process; on PythonAnywhere that is usually one process — jobs are still serialized in SQLite.
+3. The handler returns **202** with `job_id` and starts a **daemon thread** worker that processes the SQLite queue (**`QUEUE_DB_PATH`**, default under `logs/`). One worker per web process; on PythonAnywhere that is usually one process — jobs are still serialized in SQLite, so two webhooks never edit the workbook at the same time.
 
 Local testing without a secret: set **`LOAN_AUTOMATOR_WEBHOOK_ALLOW_INSECURE=1`** (never in production).
 
@@ -134,16 +126,19 @@ py -3 orchestrator.py --dry-run --placement-last-n 5 --enrich-lookback-days 2
 
 ## PythonAnywhere
 
-- Clone the repo, `pip install --user -r requirements.txt`.
-- Upload workbooks (SFTP) under e.g. `/home/<user>/loan-automator/data/`.
-- Either export variables in `~/.bashrc` or set `DOTENV_PATH` to your secrets file and call `load_dotenv` from `orchestrator.py` (already supported via `python-dotenv` and `DOTENV_PATH`).
+- Clone the repo to `/home/sergiovegadev93/loan-automator`, `pip install --user -r requirements.txt`.
+- Put secrets in `/home/sergiovegadev93/.secrets/lmc.env`; make sure the WSGI loads it (or export `DOTENV_PATH=/home/sergiovegadev93/.secrets/lmc.env`).
+- Reload the web app after every secret or code change. Auto-deploy on push is wired through `mysite`'s `/webhooks/git-pull-loan-automator` (same `GITHUB_WEBHOOK_SECRET`).
 - Scheduled task example:
 
 ```bash
-/home/<user>/.local/bin/python /home/<user>/loan-automator/orchestrator.py
+DOTENV_PATH=/home/sergiovegadev93/.secrets/lmc.env \
+  /home/sergiovegadev93/.local/bin/python /home/sergiovegadev93/loan-automator/orchestrator.py
 ```
 
-If the scheduled task does not load `~/.bashrc`, use a wrapper script that exports variables or sets `DOTENV_PATH`.
+## Microsoft Graph permissions
+
+The Azure AD app referenced by `MS_CLIENT_ID` must have **application** permission `Files.ReadWrite.All` or `Sites.ReadWrite.All` (with admin consent granted) so the client-credentials flow can edit cells via the Excel workbook session API. The same app is used by `mysite/sharepoint_draw_upload`, so this is usually already provisioned.
 
 ## Security
 

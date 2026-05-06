@@ -1,5 +1,6 @@
 """
 Run placement + enrich + targeted backfill for a single API loan id (webhook / CLI).
+All workbook I/O goes through Microsoft Graph (SharePoint Excel API).
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ log = logging.getLogger(__name__)
 
 
 def _patcher_fee_and_street(loan_id: int) -> tuple[float, str] | None:
-    df = get_table_dataframe(config.EXCEL_PATCHER_PATH, config.PATCHER_TABLE_NAME)
+    df = get_table_dataframe(config.EXCEL_PATCHER_SP_PATH, config.PATCHER_TABLE_NAME)
     for _, row in df.iterrows():
         lid = to_number(row.get(config.PATCHER_COL_LOAN_ID))
         if lid is None or int(lid) != int(loan_id):
@@ -35,7 +36,7 @@ def run_pipeline_for_loan_id(loan_id: int, *, dry_run: bool = False) -> dict:
     """
     1) Patch MA from patcher row if present.
     2) Merge MA fields into the single Master row for this loan_id.
-    3) Backfill Origination Fee from patcher Excel for this loan_id only if still empty.
+    3) Backfill Origination Fee from patcher table for this loan_id only if still empty.
     """
     lid = int(loan_id)
     session = requests.Session()

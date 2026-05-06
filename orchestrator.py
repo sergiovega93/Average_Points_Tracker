@@ -39,19 +39,8 @@ def _ensure_utf8_stdio() -> None:
 
 
 def verify_environment(*, ping_api: bool = False) -> int:
-    """Return 0 if checks pass, non-zero otherwise."""
+    """Return 0 if checks pass, non-zero otherwise. All checks go through Graph."""
     ok = True
-    log.info("--- verify: paths ---")
-    for label, path in (
-        ("EXCEL_PATCHER_PATH", config.EXCEL_PATCHER_PATH),
-        ("EXCEL_TRACKER_PATH", config.EXCEL_TRACKER_PATH),
-    ):
-        p = Path(path)
-        if not p.is_file():
-            log.error("  %s not found: %s", label, path)
-            ok = False
-        else:
-            log.info("  %s ok (%s)", label, p)
 
     log.info("--- verify: MA credentials ---")
     if not config.MA_LENDER_ID or not config.MA_API_KEY:
@@ -60,38 +49,67 @@ def verify_environment(*, ping_api: bool = False) -> int:
     else:
         log.info("  MA_LENDER_ID present; MA_API_KEY present")
 
-    log.info("--- verify: workbook structure ---")
-    try:
-        from openpyxl import load_workbook
-
-        wb = load_workbook(config.EXCEL_PATCHER_PATH, read_only=False, data_only=True)
-        tbl_found = False
-        for sheet in wb.worksheets:
-            if config.PATCHER_TABLE_NAME in sheet.tables:
-                log.info("  Patcher: table %r on sheet %r", config.PATCHER_TABLE_NAME, sheet.title)
-                tbl_found = True
-                break
-        wb.close()
-        if not tbl_found:
-            log.error("  Patcher: table %r not found", config.PATCHER_TABLE_NAME)
-            ok = False
-    except Exception as exc:
-        log.exception("  Patcher workbook read failed: %s", exc)
+    log.info("--- verify: Microsoft Graph credentials ---")
+    missing_ms = [
+        n for n in ("MS_TENANT_ID", "MS_CLIENT_ID", "MS_CLIENT_SECRET")
+        if not getattr(config, n, "")
+    ]
+    if missing_ms:
+        log.error("  Missing: %s", ", ".join(missing_ms))
         ok = False
+    else:
+        log.info("  MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET present")
 
-    try:
-        from openpyxl import load_workbook
+    log.info(
+        "--- verify: SharePoint workbooks (site=%s, drive=default) ---",
+        config.SP_SITE_RELATIVE_PATH,
+    )
+    if not missing_ms:
+        try:
+            from services.graph_excel import (
+                get_table_columns,
+                get_token,
+                resolve_drive_id,
+                resolve_item_id,
+                resolve_site_id,
+                workbook,
+            )
 
-        wb = load_workbook(config.EXCEL_TRACKER_PATH, read_only=False, data_only=True)
-        if config.ENRICHER_SHEET_NAME not in wb.sheetnames:
-            log.error("  Tracker: missing sheet %r", config.ENRICHER_SHEET_NAME)
+            token = get_token()
+            site_id = resolve_site_id(token)
+            drive_id = resolve_drive_id(token, site_id)
+            log.info("  Graph token + site + drive resolved (drive=%s)", drive_id[-12:])
+
+            for label, sp_path, table_name in (
+                (
+                    "Patcher",
+                    config.EXCEL_PATCHER_SP_PATH,
+                    config.PATCHER_TABLE_NAME,
+                ),
+                (
+                    "Tracker",
+                    config.EXCEL_TRACKER_SP_PATH,
+                    config.ENRICHER_TABLE_NAME,
+                ),
+            ):
+                try:
+                    item_id = resolve_item_id(token, drive_id, sp_path)
+                    log.info("  %s file ok: %s (item=%s)", label, sp_path, item_id[-8:])
+                    with workbook(sp_path, persist=False) as wb:
+                        cols = get_table_columns(wb, table_name)
+                    if cols:
+                        log.info(
+                            "  %s table %r ok (%d columns)", label, table_name, len(cols)
+                        )
+                    else:
+                        log.error("  %s table %r returned 0 columns", label, table_name)
+                        ok = False
+                except Exception as exc:
+                    log.exception("  %s verify failed: %s", label, exc)
+                    ok = False
+        except Exception as exc:
+            log.exception("  Graph verify setup failed: %s", exc)
             ok = False
-        else:
-            log.info("  Tracker: sheet %r present", config.ENRICHER_SHEET_NAME)
-        wb.close()
-    except Exception as exc:
-        log.exception("  Tracker workbook read failed: %s", exc)
-        ok = False
 
     if ping_api and ok:
         import os
@@ -189,9 +207,9 @@ def main(argv: list[str] | None = None) -> int:
         os.getenv("DOTENV_PATH") or "(unset)",
     )
     log.info(
-        "Env: EXCEL_PATCHER_PATH=%s EXCEL_TRACKER_PATH=%s dry_run=%s step=%s",
-        config.EXCEL_PATCHER_PATH,
-        config.EXCEL_TRACKER_PATH,
+        "Env: PATCHER_SP=%s TRACKER_SP=%s dry_run=%s step=%s",
+        config.EXCEL_PATCHER_SP_PATH,
+        config.EXCEL_TRACKER_SP_PATH,
         args.dry_run,
         args.step,
     )
@@ -213,6 +231,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.step in ("all", "placement", "enrich"):
         config.require_ma_credentials()
+    if args.step in ("all", "placement", "enrich", "backfill"):
+        config.require_graph_credentials()
 
     if args.loan_id is not None:
         from steps.single_loan import run_pipeline_for_loan_id

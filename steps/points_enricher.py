@@ -1,6 +1,7 @@
 """
-Master Tracker enricher — MA loans/get, merge into workbook.
-Preserves Origination Fee when MA returns empty/zero (see config.ORIGINATION_FEE_COLUMN).
+Master Tracker enricher — MA loans/get, merge into the SharePoint workbook
+(table tbl_avgpoints on sheet 'MA API ID') via Microsoft Graph Excel API.
+Preserves Origination Fee when MA returns empty/zero.
 """
 from __future__ import annotations
 
@@ -11,10 +12,19 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from openpyxl import load_workbook
 from tqdm import tqdm
 
 import config
+from services.graph_excel import (
+    add_table_columns_if_missing,
+    get_table_columns,
+    jsonify_value,
+    lookup_row_index_by_key,
+    read_table,
+    update_table_cell,
+    update_table_column,
+    workbook,
+)
 
 
 def _api_auth_token() -> str:
@@ -175,10 +185,6 @@ def _parse_iso_utc_to_naive(s: str) -> datetime | None:
 
 
 def _enricher_cutoff_naive(*, lookback_days_override: int | None = None) -> datetime:
-    """
-    Rows with Creation Date >= cutoff (or Creation Date NaN) are enriched.
-    If lookback_days_override is set, use plain (now - N days) UTC for this run only.
-    """
     now_n = _utc_now_naive()
     if lookback_days_override is not None:
         return now_n - timedelta(days=max(1, int(lookback_days_override)))
@@ -204,14 +210,149 @@ def _write_last_enricher_run_marker() -> None:
     p.write_text(stamp + "\n", encoding="utf-8")
 
 
+def fetch_ma_enrichment_row(loan_id: int, *, session: requests.Session | None = None) -> dict:
+    """Single loans/get call mapped through FIELD_MAP + role + status dates helpers."""
+    s = session or requests.Session()
+    r = s.post(
+        f"{config.MA_API_BASE_V1}/loans/get",
+        headers=_headers(),
+        json={"loan_id": int(loan_id)},
+        timeout=config.TIMEOUT_S,
+    )
+    try:
+        data = r.json()
+    except ValueError:
+        return {config.API_LOAN_ID_COLUMN: int(loan_id), "Error": "loans_get non-json"}
+    if not isinstance(data, dict) or not data.get("result"):
+        return {
+            config.API_LOAN_ID_COLUMN: int(loan_id),
+            "Error": "loans_get returned no result",
+        }
+    row: dict = {config.API_LOAN_ID_COLUMN: int(loan_id)}
+    for key, label in FIELD_MAP.items():
+        val = deep_get(data, key)
+        if "date" in key and isinstance(val, int):
+            val = datetime.fromtimestamp(val, tz=timezone.utc).strftime("%Y-%m-%d")
+        row[label] = "" if val in (None, {}, []) else val
+    row["Sales Rep"] = get_role_user(data, "Sales")
+    row["Office Rep"] = get_role_user(data, "Office Rep")
+    row.update(extract_status_dates(data))
+    return row
+
+
+def _filter_loan_ids_by_creation_date(
+    df: pd.DataFrame, cutoff_naive: datetime
+) -> list[int]:
+    """Pick rows whose Creation Date is missing OR >= cutoff (naive UTC)."""
+    if config.API_LOAN_ID_COLUMN not in df.columns:
+        return []
+    if "Creation Date" in df.columns:
+        cd = pd.to_datetime(df["Creation Date"], errors="coerce", utc=False)
+        if hasattr(cd, "dt") and cd.dt.tz is not None:
+            cd = cd.dt.tz_convert(None)
+        mask = cd.isna() | (cd >= cutoff_naive)
+        ids_raw = df.loc[mask, config.API_LOAN_ID_COLUMN].tolist()
+    else:
+        ids_raw = df[config.API_LOAN_ID_COLUMN].tolist()
+    out: list[int] = []
+    for raw in ids_raw:
+        if raw is None or raw == "":
+            continue
+        try:
+            out.append(int(str(raw).strip().replace(",", "")))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _merge_enriched_into_df(
+    df: pd.DataFrame, enriched_rows: list[dict]
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Apply enrichment to the in-memory DataFrame. Preserves Origination Fee
+    when MA returned empty/zero but the existing cell has a non-zero value.
+    Returns (df, per_loan_audit_rows_for_dryrun).
+    """
+    df = df.astype(object).copy()
+    audit_rows: list[dict] = []
+    n_orig_ma = n_orig_pres = n_orig_empty = n_orig_api_err = 0
+    preserved = 0
+
+    for enriched in enriched_rows:
+        try:
+            lid = int(enriched.get(config.API_LOAN_ID_COLUMN))
+        except (TypeError, ValueError):
+            continue
+        idx = lookup_row_index_by_key(df, config.API_LOAN_ID_COLUMN, lid)
+        if idx is None:
+            continue
+        api_err = enriched.get("Error")
+        fee_ma_raw = enriched.get(config.ORIGINATION_FEE_COLUMN)
+        existing_orig_cell = (
+            df.at[idx, config.ORIGINATION_FEE_COLUMN]
+            if config.ORIGINATION_FEE_COLUMN in df.columns
+            else None
+        )
+        orig_source: str | None = None
+
+        for col_name in ENRICHMENT_ORDER:
+            if col_name not in df.columns:
+                continue
+            val = enriched.get(col_name)
+            if col_name == config.ORIGINATION_FEE_COLUMN:
+                if _fee_is_missing_or_zero(val):
+                    if not _fee_is_missing_or_zero(existing_orig_cell):
+                        val = existing_orig_cell
+                        preserved += 1
+                        orig_source = "preserved_master"
+                    else:
+                        orig_source = "empty_after_ma"
+                else:
+                    orig_source = "ma"
+            df.at[idx, col_name] = "" if val in (None, {}, []) else val
+
+        if api_err:
+            orig_source = orig_source or "api_row_error"
+        if not orig_source:
+            orig_source = "unknown"
+
+        if orig_source == "ma":
+            n_orig_ma += 1
+        elif orig_source == "preserved_master":
+            n_orig_pres += 1
+        elif orig_source == "empty_after_ma":
+            n_orig_empty += 1
+        elif orig_source == "api_row_error":
+            n_orig_api_err += 1
+
+        audit_rows.append(
+            {
+                "loan_id": lid,
+                "origination_fee_from_ma_api": fee_ma_raw,
+                "origination_fee_master_cell_before_merge": existing_orig_cell,
+                "origination_fee_source_after_step2": orig_source,
+                "api_row_error": api_err or "",
+            }
+        )
+
+    summary = {
+        "origination_fee_preserved": preserved,
+        "orig_from_ma": n_orig_ma,
+        "orig_preserved_master": n_orig_pres,
+        "orig_empty_after_ma": n_orig_empty,
+        "orig_api_row_error": n_orig_api_err,
+    }
+    return df, {"summary": summary, "audit_rows": audit_rows}
+
+
 def run_enricher(
     *,
     dry_run: bool = False,
     lookback_days_override: int | None = None,
 ) -> dict:
     """
-    Enrich Master Tracker from MA. Does not save workbook if dry_run.
-    Returns a small summary dict (rows written, preserved fees count).
+    Enrich the Master Tracker table from MA. With dry_run=True, no PATCH is sent.
+    Returns a summary dict.
     """
     cutoff = _enricher_cutoff_naive(lookback_days_override=lookback_days_override)
     mode = (config.ENRICHER_LOOKBACK_MODE or "days").strip().lower()
@@ -230,225 +371,98 @@ def run_enricher(
         p = Path(config.ENRICHER_LAST_RUN_FILE)
         print(f"  Last-run marker file: {p} (exists={p.is_file()})")
 
-    df = pd.read_excel(
-        config.EXCEL_TRACKER_PATH,
-        sheet_name=config.ENRICHER_SHEET_NAME,
-        engine="openpyxl",
-    )
-    if "Creation Date" in df.columns:
-        df["Creation Date"] = pd.to_datetime(df["Creation Date"], errors="coerce")
-        mask = df["Creation Date"].isna() | (df["Creation Date"] >= cutoff)
-        loan_ids = df.loc[mask, config.API_LOAN_ID_COLUMN].dropna().astype(int)
-    else:
-        loan_ids = df[config.API_LOAN_ID_COLUMN].dropna().astype(int)
+    config.require_graph_credentials()
 
-    print(f"  Enriching {len(loan_ids)} loan(s)...")
-    enriched_rows = []
-    t0 = time.time()
-    session = requests.Session()
-
-    for loan_id in tqdm(loan_ids, desc="  MA API", unit="loan"):
-        try:
-            r = session.post(
-                "https://app.mortgageautomator.com/api/loans/get",
-                headers=_headers(),
-                json={"loan_id": int(loan_id)},
-                timeout=config.TIMEOUT_S,
-            )
-            data = r.json()
-            row = {config.API_LOAN_ID_COLUMN: int(loan_id)}
-            for key, label in FIELD_MAP.items():
-                val = deep_get(data, key)
-                if "date" in key and isinstance(val, int):
-                    val = datetime.fromtimestamp(
-                        val, tz=timezone.utc
-                    ).strftime("%Y-%m-%d")
-                row[label] = "" if val in (None, {}, []) else val
-            row["Sales Rep"] = get_role_user(data, "Sales")
-            row["Office Rep"] = get_role_user(data, "Office Rep")
-            row.update(extract_status_dates(data))
-            enriched_rows.append(row)
-        except Exception as e:
-            enriched_rows.append({config.API_LOAN_ID_COLUMN: int(loan_id), "Error": str(e)})
-
-        time.sleep(config.SLEEP_BETWEEN_CALLS)
-
-    print(f"  Fetched in {time.time() - t0:.1f}s — merging into sheet...")
-    df_enriched = pd.DataFrame(enriched_rows)
-    wb = load_workbook(config.EXCEL_TRACKER_PATH)
-    ws = wb[config.ENRICHER_SHEET_NAME]
-
-    header_row = [cell.value for cell in ws[1]]
-    static_cols = 3
-    while (
-        static_cols < len(header_row)
-        and header_row[static_cols]
-        and header_row[static_cols] not in ENRICHMENT_ORDER
-    ):
-        static_cols += 1
-    col_start = static_cols + 1
-    api_id_list = [cell.value for cell in ws["B"][1:]]
-
-    orig_off = ENRICHMENT_ORDER.index(config.ORIGINATION_FEE_COLUMN)
-    preserved = 0
-    per_loan_rows: list[dict] = []
-    n_orig_ma = n_orig_pres = n_orig_empty = n_orig_api_err = 0
     merge_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary: dict = {}
 
-    for offset, col_name in enumerate(ENRICHMENT_ORDER):
-        ws.cell(row=1, column=col_start + offset).value = col_name
+    with workbook(config.EXCEL_TRACKER_SP_PATH, persist=not dry_run) as wb:
+        existing_cols = get_table_columns(wb, config.ENRICHER_TABLE_NAME)
+        missing_cols = [c for c in ENRICHMENT_ORDER if c not in existing_cols]
+        if missing_cols:
+            print(f"  Adding missing enrichment columns: {missing_cols}")
+            add_table_columns_if_missing(wb, config.ENRICHER_TABLE_NAME, missing_cols)
 
-    for idx, api_id in enumerate(api_id_list, start=2):
-        if api_id is None or api_id == "":
-            continue
-        try:
-            lid = int(api_id)
-        except (TypeError, ValueError):
-            continue
-        match = df_enriched[df_enriched[config.API_LOAN_ID_COLUMN] == lid]
-        if match.empty:
-            continue
-        d = match.iloc[0].to_dict()
-        fee_ma_raw = d.get(config.ORIGINATION_FEE_COLUMN)
-        existing_orig_cell = ws.cell(row=idx, column=col_start + orig_off).value
-        orig_source: str | None = None
-        api_err = d.get("Error")
-
-        for offset, col_name in enumerate(ENRICHMENT_ORDER):
-            val = d.get(col_name)
-            if col_name == config.ORIGINATION_FEE_COLUMN:
-                if _fee_is_missing_or_zero(val):
-                    existing = ws.cell(row=idx, column=col_start + offset).value
-                    if not _fee_is_missing_or_zero(existing):
-                        val = existing
-                        preserved += 1
-                        orig_source = "preserved_master"
-                    else:
-                        orig_source = "empty_after_ma"
-                else:
-                    orig_source = "ma"
-            ws.cell(row=idx, column=col_start + offset).value = (
-                "" if val in (None, {}, []) else val
+        df = read_table(wb, config.ENRICHER_TABLE_NAME)
+        rows_on_table = len(df)
+        if df.empty or config.API_LOAN_ID_COLUMN not in df.columns:
+            print(
+                f"  [enrich] table {config.ENRICHER_TABLE_NAME!r} empty or missing "
+                f"{config.API_LOAN_ID_COLUMN!r}; nothing to do."
             )
+            return {
+                "rows_on_sheet": rows_on_table,
+                "origination_fee_preserved": 0,
+                "enrich_loan_count": 0,
+                "orig_from_ma": 0,
+                "orig_preserved_master": 0,
+                "orig_empty_after_ma": 0,
+                "orig_api_row_error": 0,
+            }
 
-        if api_err:
-            orig_source = orig_source or "api_row_error"
-        if not orig_source:
-            orig_source = "unknown"
+        loan_ids = _filter_loan_ids_by_creation_date(df, cutoff)
+        print(f"  Enriching {len(loan_ids)} loan(s)...")
 
-        if orig_source == "ma":
-            n_orig_ma += 1
-        elif orig_source == "preserved_master":
-            n_orig_pres += 1
-        elif orig_source == "empty_after_ma":
-            n_orig_empty += 1
-        elif orig_source == "api_row_error":
-            n_orig_api_err += 1
+        enriched_rows: list[dict] = []
+        t0 = time.time()
+        session = requests.Session()
+        for loan_id in tqdm(loan_ids, desc="  MA API", unit="loan"):
+            try:
+                row = fetch_ma_enrichment_row(int(loan_id), session=session)
+                enriched_rows.append(row)
+            except Exception as e:
+                enriched_rows.append(
+                    {config.API_LOAN_ID_COLUMN: int(loan_id), "Error": str(e)}
+                )
+            time.sleep(config.SLEEP_BETWEEN_CALLS)
+        print(f"  Fetched in {time.time() - t0:.1f}s — merging in memory...")
+
+        df_merged, merge_meta = _merge_enriched_into_df(df, enriched_rows)
+
+        summary = {
+            "rows_on_sheet": rows_on_table,
+            "enrich_loan_count": len(loan_ids),
+            **merge_meta["summary"],
+        }
 
         if dry_run:
-            per_loan_rows.append(
-                {
-                    "loan_id": lid,
-                    "origination_fee_from_ma_api": fee_ma_raw,
-                    "origination_fee_master_cell_before_merge": existing_orig_cell,
-                    "origination_fee_source_after_step2": orig_source,
-                    "api_row_error": api_err or "",
-                }
+            from .placement_fee_backfill import preview_backfill_on_dataframe
+
+            bf_prev = preview_backfill_on_dataframe(df_merged)
+            summary["backfill_preview_rows"] = len(bf_prev)
+            audit_rows = merge_meta["audit_rows"]
+            if audit_rows:
+                p2 = config.LOGS_DIR / f"dryrun_step2_by_loan_{merge_stamp}.csv"
+                pd.DataFrame(audit_rows).to_csv(p2, index=False, encoding="utf-8-sig")
+                print(f"  [dry-run] per-loan enrich -> {p2}")
+            if bf_prev:
+                p3 = config.LOGS_DIR / f"dryrun_step3_backfill_preview_{merge_stamp}.csv"
+                pd.DataFrame(bf_prev).to_csv(p3, index=False, encoding="utf-8-sig")
+                print(f"  [dry-run] backfill preview (post-merge in memory) -> {p3}")
+            print(
+                f"  [dry-run] would push enrichment; preserved_fee_cells="
+                f"{summary['origination_fee_preserved']}; backfill rows that would get "
+                f"Excel fee: {len(bf_prev)}"
+            )
+        else:
+            touched_cols = [c for c in ENRICHMENT_ORDER if c in df_merged.columns]
+            print(
+                f"  Pushing {len(touched_cols)} column(s) to Graph "
+                f"(leaves user-managed columns + formulas untouched)..."
+            )
+            for col_name in touched_cols:
+                values = df_merged[col_name].tolist()
+                update_table_column(
+                    wb, config.ENRICHER_TABLE_NAME, col_name, values
+                )
+            _write_last_enricher_run_marker()
+            print(
+                f"  Workbook saved (column-by-column Graph PATCH). "
+                f"origination_fee_preserved={summary['origination_fee_preserved']}; "
+                f"last-run marker updated."
             )
 
-    summary: dict = {
-        "rows_on_sheet": len(api_id_list),
-        "origination_fee_preserved": preserved,
-        "enrich_loan_count": int(len(loan_ids)),
-        "orig_from_ma": n_orig_ma,
-        "orig_preserved_master": n_orig_pres,
-        "orig_empty_after_ma": n_orig_empty,
-        "orig_api_row_error": n_orig_api_err,
-    }
-
-    if dry_run:
-        from .placement_fee_backfill import preview_backfill_on_worksheet
-
-        bf_prev = preview_backfill_on_worksheet(ws)
-        summary["backfill_preview_rows"] = bf_prev
-        if per_loan_rows:
-            p2 = config.LOGS_DIR / f"dryrun_step2_by_loan_{merge_stamp}.csv"
-            pd.DataFrame(per_loan_rows).to_csv(p2, index=False, encoding="utf-8-sig")
-            print(f"  [dry-run] per-loan enrich -> {p2}")
-        if bf_prev:
-            p3 = config.LOGS_DIR / f"dryrun_step3_backfill_preview_{merge_stamp}.csv"
-            pd.DataFrame(bf_prev).to_csv(p3, index=False, encoding="utf-8-sig")
-            print(f"  [dry-run] backfill preview (post-merge in memory) -> {p3}")
-        print(
-            f"  [dry-run] would save workbook; preserved_fee_cells={preserved}; "
-            f"step3 backfill rows that would get Excel fee: {len(bf_prev)}"
-        )
-        wb.close()
-    else:
-        wb.save(config.EXCEL_TRACKER_PATH)
-        _write_last_enricher_run_marker()
-        print(
-            f"  Workbook saved. origination_fee_preserved={preserved}; "
-            f"last-run marker updated."
-        )
-        wb.close()
     return summary
-
-
-def _enrichment_col_start(ws) -> int:
-    header_row = [cell.value for cell in ws[1]]
-    static_cols = 3
-    while (
-        static_cols < len(header_row)
-        and header_row[static_cols]
-        and header_row[static_cols] not in ENRICHMENT_ORDER
-    ):
-        static_cols += 1
-    return static_cols + 1
-
-
-def _find_master_row_for_loan(ws, loan_id: int) -> int | None:
-    from .placement_fee_backfill import _find_header_column
-
-    col_id = _find_header_column(ws, config.API_LOAN_ID_COLUMN)
-    if col_id is None:
-        col_id = 2
-    for row_idx in range(2, ws.max_row + 1):
-        v = ws.cell(row=row_idx, column=col_id).value
-        try:
-            if int(v) == int(loan_id):
-                return row_idx
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def fetch_ma_enrichment_row(loan_id: int) -> dict:
-    """Single loans/get + same field mapping as batch enricher."""
-    session = requests.Session()
-    r = session.post(
-        "https://app.mortgageautomator.com/api/loans/get",
-        headers=_headers(),
-        json={"loan_id": int(loan_id)},
-        timeout=config.TIMEOUT_S,
-    )
-    data = r.json()
-    if not isinstance(data, dict) or not data.get("result"):
-        return {
-            config.API_LOAN_ID_COLUMN: int(loan_id),
-            "Error": "loans_get returned no result",
-        }
-    row: dict = {config.API_LOAN_ID_COLUMN: int(loan_id)}
-    for key, label in FIELD_MAP.items():
-        val = deep_get(data, key)
-        if "date" in key and isinstance(val, int):
-            val = datetime.fromtimestamp(val, tz=timezone.utc).strftime("%Y-%m-%d")
-        row[label] = "" if val in (None, {}, []) else val
-    row["Sales Rep"] = get_role_user(data, "Sales")
-    row["Office Rep"] = get_role_user(data, "Office Rep")
-    row.update(extract_status_dates(data))
-    time.sleep(config.SLEEP_BETWEEN_CALLS)
-    return row
 
 
 def merge_single_loan_into_master(
@@ -458,51 +472,48 @@ def merge_single_loan_into_master(
     update_last_run_marker: bool = False,
 ) -> dict:
     """
-    Fetch MA for one loan and merge ENRICHMENT_ORDER into the matching Master row.
-    Does not touch other rows. By default does not update last_enricher_run.iso
-    (webhook / single-loan runs should not shrink since_last_run windows).
+    Webhook / single-loan path: fetch one MA loan and PATCH only that table row.
     """
-    row = fetch_ma_enrichment_row(loan_id)
-    if row.get("Error"):
-        return {"error": row["Error"], "loan_id": loan_id}
-    wb = load_workbook(config.EXCEL_TRACKER_PATH)
-    ws = wb[config.ENRICHER_SHEET_NAME]
-    idx = _find_master_row_for_loan(ws, loan_id)
-    if idx is None:
-        wb.close()
-        return {"error": "master_row_not_found", "loan_id": loan_id}
+    config.require_graph_credentials()
+    enriched = fetch_ma_enrichment_row(int(loan_id))
+    if enriched.get("Error"):
+        return {"error": enriched["Error"], "loan_id": int(loan_id)}
 
-    col_start = _enrichment_col_start(ws)
-    orig_off = ENRICHMENT_ORDER.index(config.ORIGINATION_FEE_COLUMN)
-    d = row
-    preserved = 0
+    with workbook(config.EXCEL_TRACKER_SP_PATH, persist=not dry_run) as wb:
+        existing_cols = get_table_columns(wb, config.ENRICHER_TABLE_NAME)
+        missing_cols = [c for c in ENRICHMENT_ORDER if c not in existing_cols]
+        if missing_cols:
+            print(f"  Adding missing enrichment columns: {missing_cols}")
+            add_table_columns_if_missing(wb, config.ENRICHER_TABLE_NAME, missing_cols)
 
-    for offset, col_name in enumerate(ENRICHMENT_ORDER):
-        ws.cell(row=1, column=col_start + offset).value = col_name
+        df = read_table(wb, config.ENRICHER_TABLE_NAME)
+        idx = lookup_row_index_by_key(df, config.API_LOAN_ID_COLUMN, loan_id)
+        if idx is None:
+            return {"error": "master_row_not_found", "loan_id": int(loan_id)}
 
-    for offset, col_name in enumerate(ENRICHMENT_ORDER):
-        val = d.get(col_name)
-        if col_name == config.ORIGINATION_FEE_COLUMN:
-            if _fee_is_missing_or_zero(val):
-                existing = ws.cell(row=idx, column=col_start + offset).value
-                if not _fee_is_missing_or_zero(existing):
-                    val = existing
-                    preserved += 1
-        ws.cell(row=idx, column=col_start + offset).value = (
-            "" if val in (None, {}, []) else val
-        )
+        df_merged, merge_meta = _merge_enriched_into_df(df, [enriched])
+        preserved = merge_meta["summary"]["origination_fee_preserved"]
 
-    summary = {
-        "loan_id": loan_id,
-        "master_row": idx,
-        "origination_fee_preserved": preserved,
-    }
-    if dry_run:
-        wb.close()
-        summary["dry_run"] = True
-    else:
-        wb.save(config.EXCEL_TRACKER_PATH)
+        result = {
+            "loan_id": int(loan_id),
+            "table_row_index": idx,
+            "origination_fee_preserved": preserved,
+        }
+
+        if dry_run:
+            result["dry_run"] = True
+            return result
+
+        touched_cols = [c for c in ENRICHMENT_ORDER if c in df_merged.columns]
+        for col_name in touched_cols:
+            update_table_cell(
+                wb,
+                config.ENRICHER_TABLE_NAME,
+                idx,
+                col_name,
+                jsonify_value(df_merged.at[idx, col_name]),
+            )
         if update_last_run_marker:
             _write_last_enricher_run_marker()
-        wb.close()
-    return summary
+
+    return result

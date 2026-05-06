@@ -1,14 +1,21 @@
 """
-Backfill Origination Fee on Master Tracker from Placement Fee Patching workbook
-when the cell is still empty/zero after MA enrichment.
+Backfill Origination Fee on the Master Tracker (table tbl_avgpoints) from the
+Placement Fee Patching workbook (table tbl_of), via Microsoft Graph Excel API.
+Only fills rows where Origination Fee is still empty/zero after MA enrichment.
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from openpyxl import load_workbook
+import pandas as pd
 
 import config
+from services.graph_excel import (
+    lookup_row_index_by_key,
+    read_table,
+    update_table_cell,
+    workbook,
+)
 
 from .placement_patcher import get_table_dataframe, to_number
 
@@ -22,15 +29,9 @@ def _fee_is_missing_or_zero(val) -> bool:
         return True
 
 
-def _find_header_column(ws, name: str) -> int | None:
-    for cell in ws[1]:
-        if cell.value is not None and str(cell.value).strip() == name:
-            return cell.column
-    return None
-
-
 def load_patcher_fees() -> dict[int, float]:
-    df = get_table_dataframe(config.EXCEL_PATCHER_PATH, config.PATCHER_TABLE_NAME)
+    """Map of API Loan ID -> Origination Fee from the patcher SharePoint table."""
+    df = get_table_dataframe(config.EXCEL_PATCHER_SP_PATH, config.PATCHER_TABLE_NAME)
     out: dict[int, float] = {}
     for _, row in df.iterrows():
         lid = to_number(row.get(config.PATCHER_COL_LOAN_ID))
@@ -41,26 +42,31 @@ def load_patcher_fees() -> dict[int, float]:
     return out
 
 
-def preview_backfill_on_worksheet(ws) -> list[dict]:
+def preview_backfill_on_dataframe(
+    df: pd.DataFrame, fees_by_loan: dict[int, float] | None = None
+) -> list[dict]:
     """
-    After enricher merged into ws in memory (dry-run), list rows that step-3 would fill
-    from the Placement Fee Patching workbook.
+    Given the Master Tracker DataFrame already merged with MA fields (in memory),
+    return rows where Origination Fee is missing/zero AND patcher has a fee.
     """
-    fees_by_loan = load_patcher_fees()
-    col_id = _find_header_column(ws, config.API_LOAN_ID_COLUMN)
-    col_fee = _find_header_column(ws, config.ORIGINATION_FEE_COLUMN)
-    if col_id is None or col_fee is None:
+    if df.empty:
+        return []
+    if fees_by_loan is None:
+        fees_by_loan = load_patcher_fees()
+    if (
+        config.API_LOAN_ID_COLUMN not in df.columns
+        or config.ORIGINATION_FEE_COLUMN not in df.columns
+    ):
         return []
     out: list[dict] = []
-    for row_idx in range(2, ws.max_row + 1):
-        raw_id = ws.cell(row=row_idx, column=col_id).value
+    for i, raw_id in enumerate(df[config.API_LOAN_ID_COLUMN].tolist()):
         if raw_id is None or raw_id == "":
             continue
         try:
-            lid = int(raw_id)
+            lid = int(str(raw_id).strip().replace(",", ""))
         except (TypeError, ValueError):
             continue
-        current = ws.cell(row=row_idx, column=col_fee).value
+        current = df.at[i, config.ORIGINATION_FEE_COLUMN] if i in df.index else None
         if not _fee_is_missing_or_zero(current):
             continue
         desired = fees_by_loan.get(lid)
@@ -69,8 +75,8 @@ def preview_backfill_on_worksheet(ws) -> list[dict]:
         out.append(
             {
                 "loan_id": lid,
-                "master_excel_row": row_idx,
-                "fee_would_set_from_patcher_excel": desired,
+                "table_row_index_zero_based": i,
+                "fee_would_set_from_patcher": desired,
             }
         )
     return out
@@ -78,67 +84,74 @@ def preview_backfill_on_worksheet(ws) -> list[dict]:
 
 def run_backfill(*, dry_run: bool = False, only_loan_ids: set[int] | None = None) -> dict:
     """
-    If only_loan_ids is set, only rows whose API Loan ID is in that set may be updated.
+    Open the Master Tracker workbook via Graph, read tbl_avgpoints, fill missing
+    Origination Fee cells from the patcher table, write back via Graph.
     """
     fees_by_loan = load_patcher_fees()
-    wb = load_workbook(config.EXCEL_TRACKER_PATH)
-    ws = wb[config.ENRICHER_SHEET_NAME]
-
-    col_id = _find_header_column(ws, config.API_LOAN_ID_COLUMN)
-    col_fee = _find_header_column(ws, config.ORIGINATION_FEE_COLUMN)
-    if col_id is None:
-        wb.close()
-        raise ValueError(
-            f"Column '{config.API_LOAN_ID_COLUMN}' not found in row 1 of sheet "
-            f"'{config.ENRICHER_SHEET_NAME}'."
-        )
-    if col_fee is None:
-        wb.close()
-        raise ValueError(
-            f"Column '{config.ORIGINATION_FEE_COLUMN}' not found in row 1. "
-            "Run enricher once so headers exist, or add the column."
-        )
 
     filled = 0
     skipped_has_value = 0
     skipped_no_patcher_row = 0
+    rows_on_table = 0
 
-    for row_idx in range(2, ws.max_row + 1):
-        raw_id = ws.cell(row=row_idx, column=col_id).value
-        if raw_id is None or raw_id == "":
-            continue
-        try:
-            lid = int(raw_id)
-        except (TypeError, ValueError):
-            continue
-        if only_loan_ids is not None and lid not in only_loan_ids:
-            continue
-        current = ws.cell(row=row_idx, column=col_fee).value
-        if not _fee_is_missing_or_zero(current):
-            skipped_has_value += 1
-            continue
-        desired = fees_by_loan.get(lid)
-        if desired is None:
-            skipped_no_patcher_row += 1
-            continue
-        if dry_run:
-            print(f"  [dry-run] row {row_idx} loan {lid}: would set fee -> {desired}")
+    with workbook(config.EXCEL_TRACKER_SP_PATH, persist=not dry_run) as wb:
+        df = read_table(wb, config.ENRICHER_TABLE_NAME)
+        rows_on_table = len(df)
+        if df.empty or config.API_LOAN_ID_COLUMN not in df.columns:
+            print(
+                f"  [backfill] tbl {config.ENRICHER_TABLE_NAME!r} empty or missing "
+                f"{config.API_LOAN_ID_COLUMN!r} column; nothing to do."
+            )
+        elif config.ORIGINATION_FEE_COLUMN not in df.columns:
+            raise ValueError(
+                f"Column {config.ORIGINATION_FEE_COLUMN!r} not found in table "
+                f"{config.ENRICHER_TABLE_NAME!r}. Run enricher once so the column exists."
+            )
         else:
-            ws.cell(row=row_idx, column=col_fee).value = desired
-        filled += 1
+            for i, raw_id in enumerate(df[config.API_LOAN_ID_COLUMN].tolist()):
+                if raw_id is None or raw_id == "":
+                    continue
+                try:
+                    lid = int(str(raw_id).strip().replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+                if only_loan_ids is not None and lid not in only_loan_ids:
+                    continue
+                current = (
+                    df.at[i, config.ORIGINATION_FEE_COLUMN] if i in df.index else None
+                )
+                if not _fee_is_missing_or_zero(current):
+                    skipped_has_value += 1
+                    continue
+                desired = fees_by_loan.get(lid)
+                if desired is None:
+                    skipped_no_patcher_row += 1
+                    continue
+                if dry_run:
+                    print(
+                        f"  [dry-run] table row {i} loan {lid}: would set fee -> {desired}"
+                    )
+                else:
+                    update_table_cell(
+                        wb,
+                        config.ENRICHER_TABLE_NAME,
+                        i,
+                        config.ORIGINATION_FEE_COLUMN,
+                        desired,
+                    )
+                filled += 1
 
     summary = {
-        "filled_from_patcher_excel": filled,
+        "filled_from_patcher": filled,
         "skipped_row_already_has_fee": skipped_has_value,
         "skipped_no_fee_in_patcher_table": skipped_no_patcher_row,
         "patcher_table_loans": len(fees_by_loan),
+        "rows_on_master_table": rows_on_table,
     }
 
     if dry_run:
         print(f"  [dry-run] backfill summary: {summary}")
-        wb.close()
     else:
-        wb.save(config.EXCEL_TRACKER_PATH)
         print(f"  Backfill saved. summary: {summary}")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -147,3 +160,8 @@ def run_backfill(*, dry_run: bool = False, only_loan_ids: set[int] | None = None
             f.write(f"{k}={v}\n")
 
     return summary
+
+
+def find_master_row_index_for_loan(df: pd.DataFrame, loan_id: int) -> int | None:
+    """0-based table-row index for a loan_id, used by single-loan merge helpers."""
+    return lookup_row_index_by_key(df, config.API_LOAN_ID_COLUMN, loan_id)

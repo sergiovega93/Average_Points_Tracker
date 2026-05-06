@@ -1,5 +1,7 @@
 """
 Central configuration. Loads environment from DOTENV_PATH or project .env.
+All workbook I/O now goes through Microsoft Graph (SharePoint Excel API);
+the legacy EXCEL_PATCHER_PATH / EXCEL_TRACKER_PATH local-file vars are gone.
 """
 from __future__ import annotations
 
@@ -20,18 +22,8 @@ else:
 LOGS_DIR = BASE_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-def _env_path(name: str, default: Path) -> str:
-    raw = os.getenv(name, "").strip()
-    return str(default) if not raw else raw
 
-
-EXCEL_PATCHER_PATH = _env_path(
-    "EXCEL_PATCHER_PATH", BASE_DIR / "data" / "Placement_Fee_Patching.xlsx"
-)
-EXCEL_TRACKER_PATH = _env_path(
-    "EXCEL_TRACKER_PATH", BASE_DIR / "data" / "Master_Tracker_Points_Average.xlsx"
-)
-
+# --- Mortgage Automator ---
 MA_LENDER_ID = os.getenv("MA_LENDER_ID", "").strip()
 MA_API_KEY = os.getenv("MA_API_KEY", "").strip()
 
@@ -44,7 +36,28 @@ MA_API_BASE_V2 = os.getenv(
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
-# --- Patcher ---
+
+# --- Microsoft Graph (SharePoint Excel) ---
+MS_TENANT_ID = os.getenv("MS_TENANT_ID", "").strip()
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "").strip()
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "").strip()
+
+SP_HOSTNAME = os.getenv("SP_HOSTNAME", "loanmountaincapital.sharepoint.com").strip()
+SP_SITE_RELATIVE_PATH = os.getenv(
+    "SP_SITE_RELATIVE_PATH", "sites/LoanMountainCapital-General"
+).strip()
+
+EXCEL_PATCHER_SP_PATH = os.getenv(
+    "EXCEL_PATCHER_SP_PATH",
+    "General/Project Raptor 3/Underwritting/Placement Fee Patching.xlsx",
+).strip()
+EXCEL_TRACKER_SP_PATH = os.getenv(
+    "EXCEL_TRACKER_SP_PATH",
+    "General/Project Raptor 3/Sales/Master Tracker Points Average.xlsx",
+).strip()
+
+
+# --- Patcher (table on the Placement workbook) ---
 PATCHER_TABLE_NAME = os.getenv("PATCHER_TABLE_NAME", "tbl_of").strip()
 PATCHER_COL_LOAN_ID = os.getenv("PATCHER_COL_LOAN_ID", "API Loan ID").strip()
 PATCHER_COL_ORIG_FEE = os.getenv("PATCHER_COL_ORIG_FEE", "Origination Fee").strip()
@@ -58,14 +71,12 @@ VERIFY_SETTLE_WAIT = float(os.getenv("VERIFY_SETTLE_WAIT", "1.2"))
 RETRIES_PER_ENDPOINT = int(os.getenv("RETRIES_PER_ENDPOINT", "1"))
 SLEEP_BETWEEN_CALLS = float(os.getenv("SLEEP_BETWEEN_CALLS", "0.4"))
 TIMEOUT_S = int(os.getenv("TIMEOUT_S", "30"))
-WRITE_XLSX_REPORT = os.getenv("WRITE_XLSX_REPORT", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
 
-# --- Enricher ---
+
+# --- Enricher (table on the Master Tracker workbook) ---
 ENRICHER_SHEET_NAME = os.getenv("ENRICHER_SHEET_NAME", "MA API ID").strip()
+ENRICHER_TABLE_NAME = os.getenv("ENRICHER_TABLE_NAME", "tbl_avgpoints").strip()
+
 # days: include rows with Creation Date >= now - N days (UTC).
 # since_last_run: use logs/last_enricher_run.iso (minus overlap); if missing, fall back to days.
 ENRICHER_LOOKBACK_MODE = os.getenv("ENRICHER_LOOKBACK_MODE", "days").strip().lower()
@@ -75,13 +86,14 @@ _last_run_default = LOGS_DIR / "last_enricher_run.iso"
 ENRICHER_LAST_RUN_FILE = os.getenv(
     "ENRICHER_LAST_RUN_FILE", str(_last_run_default)
 ).strip()
-# Column title in Master Tracker that maps from MA placement_fee
+
 ORIGINATION_FEE_COLUMN = os.getenv(
     "ORIGINATION_FEE_COLUMN", "Origination Fee"
 ).strip()
 API_LOAN_ID_COLUMN = os.getenv("API_LOAN_ID_COLUMN", "API Loan ID").strip()
 
-# --- Webhook / job queue (optional; used by webhook_flask.py on PythonAnywhere) ---
+
+# --- Webhook / job queue (used by flask_webhook.py + loan_automator_queue.py) ---
 LOAN_AUTOMATOR_WEBHOOK_SECRET = os.getenv("LOAN_AUTOMATOR_WEBHOOK_SECRET", "").strip()
 QUEUE_DB_PATH = os.getenv(
     "QUEUE_DB_PATH",
@@ -93,6 +105,20 @@ def require_ma_credentials() -> None:
     if not MA_LENDER_ID or not MA_API_KEY:
         print(
             "Missing MA_LENDER_ID or MA_API_KEY. Set them in .env or DOTENV_PATH file.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+
+def require_graph_credentials() -> None:
+    missing = [
+        n for n in ("MS_TENANT_ID", "MS_CLIENT_ID", "MS_CLIENT_SECRET")
+        if not globals().get(n)
+    ]
+    if missing:
+        print(
+            f"Missing Microsoft Graph credentials: {', '.join(missing)}. "
+            "Set them in .env or DOTENV_PATH file.",
             file=sys.stderr,
         )
         raise SystemExit(2)

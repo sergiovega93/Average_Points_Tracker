@@ -75,8 +75,8 @@ def write_dry_run_aggregate_csv(
             "Would need step3 backfill if patcher has fee.",
         ),
         (
-            "backfill_preview_would_fill_from_patcher_excel",
-            len(enrich_summary.get("backfill_preview_rows", []) or []),
+            "backfill_preview_would_fill_from_patcher",
+            int(enrich_summary.get("backfill_preview_rows", 0) or 0),
             "Simulated on in-memory sheet after step2 merge (dry-run accurate).",
         ),
     ]
