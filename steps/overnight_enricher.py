@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 # Zapier / Master Tracker: e.g. 12/02/25 02:48PM — evita UserWarning de inferencia lenta
 CREATION_DATE_Z_COL = "Creation Date Z"
 ZAPIER_DATETIME_FORMAT = "%m/%d/%y %I:%M%p"
+ALWAYS_OVERWRITE_COLUMNS = [c for c in ENRICHMENT_ORDER if c != config.ORIGINATION_FEE_COLUMN]
 
 
 def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int]:
