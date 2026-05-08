@@ -41,7 +41,7 @@ ALWAYS_OVERWRITE_COLUMNS = [c for c in ENRICHMENT_ORDER if c != config.ORIGINATI
 def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int]:
     """
     Returns (loan_ids_in_window, count_out_of_window).
-    Includes rows where Creation Date is NaT/empty OR >= cutoff.
+    Includes rows where Creation Date is present and >= cutoff.
     Rows with no valid API Loan ID are skipped silently.
     """
     if "Creation Date" in df.columns:
@@ -51,7 +51,7 @@ def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int
     else:
         cd = pd.Series([pd.NaT] * len(df))
 
-    recent_mask = cd.isna() | (cd >= cutoff)
+    recent_mask = cd.notna() & (cd >= cutoff)
     out_of_window = int((~recent_mask).sum())
 
     ids: list[int] = []
@@ -72,7 +72,7 @@ def _recent_mask_series(df: pd.DataFrame, cutoff: datetime) -> pd.Series:
             cd = cd.dt.tz_convert(None)
     else:
         cd = pd.Series([pd.NaT] * len(df), index=df.index)
-    return cd.isna() | (cd >= cutoff)
+    return cd.notna() & (cd >= cutoff)
 
 
 def _parse_loan_id_cell(raw) -> int | None:
@@ -91,7 +91,7 @@ def run_overnight_enricher(
 ) -> dict:
     """
     Enriches Master Tracker from MA API. Legacy-style: overwrites all enrichment
-    columns for every loan whose Creation Date is within the lookback window (or empty).
+    columns for every loan whose Creation Date is within the lookback window (present and >= cutoff).
     Exception: Origination Fee is only overwritten when MA returns a non-zero, non-null value,
     preserving any fee that was backfilled from Placement Fee Patching (NOT_SUPPORTED_OLD_CORE case).
     """
