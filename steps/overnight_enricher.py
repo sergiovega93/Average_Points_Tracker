@@ -41,11 +41,13 @@ ALWAYS_OVERWRITE_COLUMNS = [c for c in ENRICHMENT_ORDER if c != config.ORIGINATI
 def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int]:
     """
     Returns (loan_ids_in_window, count_out_of_window).
-    Includes rows where Creation Date is present and >= cutoff.
+    Includes rows where Creation Date Z is present and >= cutoff.
     Rows with no valid API Loan ID are skipped silently.
     """
-    if "Creation Date" in df.columns:
-        cd = pd.to_datetime(df["Creation Date"], errors="coerce", utc=False)
+    FILTER_COL = "Creation Date Z"
+
+    if FILTER_COL in df.columns:
+        cd = pd.to_datetime(df[FILTER_COL], errors="coerce", utc=False)
         if hasattr(cd, "dt") and cd.dt.tz is not None:
             cd = cd.dt.tz_convert(None)
     else:
