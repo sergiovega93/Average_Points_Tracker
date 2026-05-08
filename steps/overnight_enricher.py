@@ -34,8 +34,9 @@ from steps.points_enricher import (
 
 log = logging.getLogger(__name__)
 
-# All enrichment columns except Origination Fee — always overwritten unconditionally
-ALWAYS_OVERWRITE_COLUMNS = [c for c in ENRICHMENT_ORDER if c != config.ORIGINATION_FEE_COLUMN]
+# Zapier / Master Tracker: e.g. 12/02/25 02:48PM — evita UserWarning de inferencia lenta
+CREATION_DATE_Z_COL = "Creation Date Z"
+ZAPIER_DATETIME_FORMAT = "%m/%d/%y %I:%M%p"
 
 
 def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int]:
@@ -44,10 +45,15 @@ def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int
     Includes rows where Creation Date Z is present and >= cutoff.
     Rows with no valid API Loan ID are skipped silently.
     """
-    FILTER_COL = "Creation Date Z"
+    FILTER_COL = CREATION_DATE_Z_COL
 
     if FILTER_COL in df.columns:
-        cd = pd.to_datetime(df[FILTER_COL], errors="coerce", utc=False)
+        cd = pd.to_datetime(
+            df[FILTER_COL],
+            format=ZAPIER_DATETIME_FORMAT,
+            errors="coerce",
+            utc=False,
+        )
         if hasattr(cd, "dt") and cd.dt.tz is not None:
             cd = cd.dt.tz_convert(None)
     else:
@@ -68,8 +74,14 @@ def _select_loan_ids(df: pd.DataFrame, cutoff: datetime) -> tuple[list[int], int
 
 
 def _recent_mask_series(df: pd.DataFrame, cutoff: datetime) -> pd.Series:
-    if "Creation Date" in df.columns:
-        cd = pd.to_datetime(df["Creation Date"], errors="coerce", utc=False)
+    FILTER_COL = CREATION_DATE_Z_COL
+    if FILTER_COL in df.columns:
+        cd = pd.to_datetime(
+            df[FILTER_COL],
+            format=ZAPIER_DATETIME_FORMAT,
+            errors="coerce",
+            utc=False,
+        )
         if hasattr(cd, "dt") and cd.dt.tz is not None:
             cd = cd.dt.tz_convert(None)
     else:
