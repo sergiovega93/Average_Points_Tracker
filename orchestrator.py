@@ -191,6 +191,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Override enricher window to last N calendar days (UTC), ignoring .env mode for this run.",
     )
     parser.add_argument(
+        "--overnight",
+        action="store_true",
+        help=(
+            "Step 2: use overnight_enricher instead of points_enricher. "
+            "Applies 180-day Creation Date window (legacy-style) with hybrid "
+            "Origination Fee rule. Combine with --enrich-lookback-days to override window."
+        ),
+    )
+    parser.add_argument(
         "--loan-id",
         type=int,
         default=None,
@@ -278,13 +287,21 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.step in ("all", "enrich"):
-        log.info("STEP 2: Points enricher")
-        from steps.points_enricher import run_enricher
+        log.info("STEP 2: %s", "Overnight enricher" if args.overnight else "Points enricher")
+        if args.overnight:
+            from steps.overnight_enricher import run_overnight_enricher
 
-        enrich_summary = run_enricher(
-            dry_run=args.dry_run,
-            lookback_days_override=args.enrich_lookback_days,
-        )
+            enrich_summary = run_overnight_enricher(
+                dry_run=args.dry_run,
+                lookback_days=args.enrich_lookback_days or 180,
+            )
+        else:
+            from steps.points_enricher import run_enricher
+
+            enrich_summary = run_enricher(
+                dry_run=args.dry_run,
+                lookback_days_override=args.enrich_lookback_days,
+            )
         log.info("Step2 summary: %s", enrich_summary)
 
     if args.step in ("all", "backfill"):
