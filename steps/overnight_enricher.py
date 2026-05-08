@@ -138,7 +138,7 @@ def run_overnight_enricher(
     n_fee_overwritten = 0
     n_fee_preserved = 0
 
-    with workbook(config.EXCEL_TRACKER_SP_PATH, persist=not dry_run) as wb:
+    with workbook(config.EXCEL_TRACKER_SP_PATH, persist=False) as wb:
         existing_cols = get_table_columns(wb, config.ENRICHER_TABLE_NAME)
         merge_cols = ALWAYS_OVERWRITE_COLUMNS + [config.ORIGINATION_FEE_COLUMN]
         missing_cols = [c for c in merge_cols if c not in existing_cols]
@@ -206,74 +206,74 @@ def run_overnight_enricher(
                     }
                 )
 
-        enriched_rows: list[dict] = []
-        session = requests.Session()
-        t0 = time.time()
-        for loan_id in tqdm(loan_ids, desc="  MA API (overnight)", unit="loan"):
-            try:
-                row = fetch_ma_enrichment_row(int(loan_id), session=session)
-                enriched_rows.append(row)
-            except Exception as e:
-                enriched_rows.append(
-                    {config.API_LOAN_ID_COLUMN: int(loan_id), "Error": str(e)}
-                )
-            time.sleep(config.SLEEP_BETWEEN_CALLS)
-        print(f"  Overnight enricher: fetched in {time.time() - t0:.1f}s — merging...")
-
-        df_merged = df.copy()
-        fee_col = config.ORIGINATION_FEE_COLUMN
-
-        for enriched in enriched_rows:
-            try:
-                lid = int(enriched.get(config.API_LOAN_ID_COLUMN))
-            except (TypeError, ValueError):
-                continue
-            idx = lookup_row_index_by_key(df_merged, config.API_LOAN_ID_COLUMN, lid)
-            if idx is None:
-                continue
-
-            is_error = bool(enriched.get("Error"))
-            if is_error:
-                n_errors += 1
-            else:
-                n_enriched += 1
-
-            for col in ALWAYS_OVERWRITE_COLUMNS:
-                if col not in df_merged.columns:
-                    continue
-                val = enriched.get(col)
-                df_merged.at[idx, col] = "" if val in (None, {}, []) else val
-
-            if fee_col in df_merged.columns:
-                fee_ma = enriched.get(fee_col)
-                if not _fee_is_missing_or_zero(fee_ma):
-                    df_merged.at[idx, fee_col] = fee_ma
-                    n_fee_overwritten += 1
-                else:
-                    n_fee_preserved += 1
-
-            fee_written = df_merged.at[idx, fee_col] if fee_col in df_merged.columns else ""
-            fee_from_ma = enriched.get(fee_col)
-            csv_rows.append(
-                {
-                    "loan_id": lid,
-                    "action": "ERROR" if is_error else "ENRICHED",
-                    "origination_fee_from_ma": "" if fee_from_ma in (None, {}, []) else fee_from_ma,
-                    "origination_fee_written": fee_written,
-                    "error_detail": (enriched.get("Error", "") if is_error else ""),
-                }
+    enriched_rows: list[dict] = []
+    session = requests.Session()
+    t0 = time.time()
+    for loan_id in tqdm(loan_ids, desc="  MA API (overnight)", unit="loan"):
+        try:
+            row = fetch_ma_enrichment_row(int(loan_id), session=session)
+            enriched_rows.append(row)
+        except Exception as e:
+            enriched_rows.append(
+                {config.API_LOAN_ID_COLUMN: int(loan_id), "Error": str(e)}
             )
+        time.sleep(config.SLEEP_BETWEEN_CALLS)
+    print(f"  Overnight enricher: fetched in {time.time() - t0:.1f}s — merging...")
 
-        if not dry_run:
+    df_merged = df.copy()
+    fee_col = config.ORIGINATION_FEE_COLUMN
+
+    for enriched in enriched_rows:
+        try:
+            lid = int(enriched.get(config.API_LOAN_ID_COLUMN))
+        except (TypeError, ValueError):
+            continue
+        idx = lookup_row_index_by_key(df_merged, config.API_LOAN_ID_COLUMN, lid)
+        if idx is None:
+            continue
+
+        is_error = bool(enriched.get("Error"))
+        if is_error:
+            n_errors += 1
+        else:
+            n_enriched += 1
+
+        for col in ALWAYS_OVERWRITE_COLUMNS:
+            if col not in df_merged.columns:
+                continue
+            val = enriched.get(col)
+            df_merged.at[idx, col] = "" if val in (None, {}, []) else val
+
+        if fee_col in df_merged.columns:
+            fee_ma = enriched.get(fee_col)
+            if not _fee_is_missing_or_zero(fee_ma):
+                df_merged.at[idx, fee_col] = fee_ma
+                n_fee_overwritten += 1
+            else:
+                n_fee_preserved += 1
+
+        fee_written = df_merged.at[idx, fee_col] if fee_col in df_merged.columns else ""
+        fee_from_ma = enriched.get(fee_col)
+        csv_rows.append(
+            {
+                "loan_id": lid,
+                "action": "ERROR" if is_error else "ENRICHED",
+                "origination_fee_from_ma": "" if fee_from_ma in (None, {}, []) else fee_from_ma,
+                "origination_fee_written": fee_written,
+                "error_detail": (enriched.get("Error", "") if is_error else ""),
+            }
+        )
+
+    if not dry_run:
+        with workbook(config.EXCEL_TRACKER_SP_PATH, persist=True) as wb:
             write_cols = ALWAYS_OVERWRITE_COLUMNS + [fee_col]
-            print("  Overnight enricher: re-reading table before write (concurrent edits)...")
             df_aligned = _realign_to_current_table(wb, df_merged)
             print(
                 f"  Overnight enricher: pushing {len(write_cols)} column(s) to Graph "
-                f"({len(df_aligned)} rows)..."
+                f"({len(df_merged)} rows)..."
             )
             for col_name in write_cols:
-                if col_name not in df_aligned.columns:
+                if col_name not in df_merged.columns:
                     continue
                 for attempt in range(3):
                     try:
@@ -296,7 +296,7 @@ def run_overnight_enricher(
                             raise
                         print(
                             f"  [overnight] {col_name}: size mismatch on attempt "
-                            f"{attempt + 1}/3; re-reading table & realigning..."
+                            f"{attempt + 1}/3; retrying..."
                         )
                         df_aligned = _realign_to_current_table(wb, df_merged)
 
